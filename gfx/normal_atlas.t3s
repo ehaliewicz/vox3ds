@@ -1,0 +1,2 @@
+-f rgb -z auto --atlas
+air_normal.png dirt_normal.png stone_normal.png obsidian_normal.png wood_normal.png coal_ore_normal.png

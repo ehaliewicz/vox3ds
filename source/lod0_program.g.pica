@@ -1,0 +1,168 @@
+; Example PICA200 geometry shader
+.gsh point c0
+
+; Uniforms
+
+; Constants
+.constf myconst(0.0, 1.0, 0.125, 0.5)
+.alias  zeros myconst.xxxx ; Vector full of zeros
+.alias  ones  myconst.yyyy ; Vector full of ones
+.alias one_eighths myconst.zzzz
+
+; Outputs - this time the type *is* used
+.out outpos position
+.out outtc0 texcoord0
+
+; Inputs: we will receive the following inputs:
+; v0-v1: position/material of v0
+; v2-v3: position/material of v1
+; v4-v5: position/material of v2
+; v6-v7: position/material of v3
+; v8-v9: v4
+; v10-v11: v5
+; v12-v13: v6
+; v14-v15: v7
+
+; this geometry shader takes 4 vertexes and outputs two triangles (6 vertexes)
+; although we receive a material index from all four vertexes, we will specifically be using the material from the fourtsh vertex
+; all vertexes are shared, except for the fourth, which will have the correct material index (shenanigans to reduce redundant vertexes in our vbo)
+
+.entry gmain
+.proc gmain
+
+    ; calculate UVs for the four vertexes
+    ; can't use just 0->1, because we use a texture atlas of 8 subtextures in a row
+    ; mat 0 UVs need to be 0->1/8, mat 2 needs 1/8->2/8, etc
+
+    mov r5, ones
+    mov r6, one_eighths
+    mov r4.x, v1.x
+    mov r4.y, v1.x
+    add r4.y, r4.y, r5.y
+    ; r4.xy = mat, mat+1
+    mul r4, r4, r6 ; r4.xy = mat/8, (mat+1)/8
+
+    mov r0.x, r4.x ; 0,0
+    mov r0.y, zeros ; 
+    mov r1.x, r4.y ; 1,0
+    mov r1.y, zeros
+    mov r2.x, r4.y ; 1,1
+    mov r2.y, ones 
+    mov r3.x, r4.x ; 0,1
+    mov r3.y, ones
+
+    ; +x face
+
+    ; for the first three faces
+    ; we share v5
+
+    setemit 0
+    mov outpos, v10
+    mov outtc0, r0
+    emit 
+
+    setemit 1
+    mov outpos, v6
+    mov outtc0, r2
+    emit
+
+    setemit 2, prim inv
+    mov outpos, v2
+    mov outtc0, r1
+    emit
+
+    setemit 2, prim
+    mov outpos, v14
+    mov outtc0, r3
+    emit
+
+    ; +z face 
+
+    setemit 1
+    mov outpos, v12
+    mov outtc0, r2
+    emit 
+
+    setemit 2, prim
+    mov outpos, v8
+    mov outtc0, r1 
+    emit 
+
+    setemit 2, prim inv
+    mov outpos, v14
+    mov outtc0, r3 
+    emit 
+
+    ; -y face 
+    setemit 1
+    mov outpos, v0;
+    mov outtc0, r2;
+    emit 
+
+    setemit 2, prim
+    mov outpos, v2;
+    mov outtc0, r1;
+    emit 
+
+    setemit 2, prim inv
+    mov outpos, v8
+    mov outtc0, r3; r1 
+    emit 
+
+    ; for the second three faces
+    ; we'll share v2
+    ; which we already use as the first vertex on the -x face anyway
+
+    ; -x face 
+
+    setemit 0
+    mov outpos, v4
+    mov outtc0, r3 
+    emit 
+    setemit 1
+    mov outpos, v8
+    mov outtc0, r1 
+    emit 
+    setemit 2, prim
+    mov outpos, v12
+    mov outtc0, r2 
+    emit 
+    setemit 2, prim inv
+    mov outpos, v0
+    mov outtc0, r0 
+    emit 
+
+    ; -z face 
+
+    setemit 1
+    mov outpos, v2 
+    mov outtc0, r1
+    emit 
+    setemit 2, prim
+    mov outpos, v0
+    mov outtc0, r0
+    emit 
+    setemit 2, prim inv 
+    mov outpos, v6
+    mov outtc0, r2
+    emit
+
+    ; +y face 
+
+    setemit 1
+    mov outpos, v14
+    mov outtc0, r1
+    emit 
+
+    setemit 2, prim
+    mov outpos, v6
+    mov outtc0, r0
+    emit 
+
+    setemit 2, prim inv
+    mov outpos, v12
+    mov outtc0, r2
+    emit 
+
+    end
+.end

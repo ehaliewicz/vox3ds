@@ -1,0 +1,154 @@
+; Example PICA200 geometry shader
+.gsh point c0
+
+; Uniforms
+
+; Constants
+.constf myconst(0.0, 1.0, 0.125, 0.00392)
+.alias  zeros myconst.xxxx ; Vector full of zeros
+.alias  ones  myconst.yyyy ; Vector full of ones
+.alias one_eighths myconst.zzzz
+.alias col_scale myconst.wwww
+
+; Outputs - this time the type *is* used
+.out outpos position
+.out outclr color
+
+; Inputs: we will receive the following inputs:
+; v0-v1: position/color of v0
+; v2-v3: position/color of v1
+; v4-v5: position/color of v2
+; v6-v7: position/color of v3
+; v8-v9: v4
+; v10-v11: v5
+; v12-v13: v6
+; v14-v15: v7
+
+; this geometry shader takes 4 vertexes and outputs two triangles (6 vertexes)
+; although we receive a material index from all four vertexes, we will specifically be using the material from the fourtsh vertex
+; all vertexes are shared, except for the fourth, which will have the correct material index (shenanigans to reduce redundant vertexes in our vbo)
+
+.entry gmain
+.proc gmain
+
+    ; v1 is color
+
+    mov r0, col_scale
+    mul r0, v1, r0
+    mov r0.w, ones.w
+
+    ; +x face
+
+    ; for the first three faces
+    ; we share v5
+
+    setemit 0
+    mov outpos, v10
+    mov outclr, r0
+    emit 
+
+    setemit 1
+    mov outpos, v6
+    mov outclr, r0
+    emit
+
+    setemit 2, prim inv
+    mov outpos, v2
+    mov outclr, r0
+    emit
+
+    setemit 2, prim
+    mov outpos, v14
+    mov outclr, r0
+    emit
+
+    ; +z face 
+
+    setemit 1
+    mov outpos, v12
+    mov outclr, r0
+    emit 
+
+    setemit 2, prim
+    mov outpos, v8
+    mov outclr, r0
+    emit 
+
+    setemit 2, prim inv
+    mov outpos, v14
+    mov outclr, r0
+    emit 
+
+    ; -y face 
+    setemit 1
+    mov outpos, v0
+    mov outclr, r0
+    emit 
+
+    setemit 2, prim
+    mov outpos, v2
+    mov outclr, r0
+    emit 
+
+    setemit 2, prim inv
+    mov outpos, v8
+    mov outclr, r0
+    emit 
+
+    ; for the second three faces
+    ; we'll share v2
+    ; which we already use as the first vertex on the -x face anyway
+
+    ; -x face 
+
+    setemit 0
+    mov outpos, v4
+    mov outclr, r0
+    emit 
+    setemit 1
+    mov outpos, v8
+    mov outclr, r0
+    emit 
+    setemit 2, prim
+    mov outpos, v12
+    mov outclr, r0
+    emit 
+    setemit 2, prim inv
+    mov outpos, v0
+    mov outclr, r0
+    emit 
+
+    ; -z face 
+
+    setemit 1
+    mov outpos, v2 
+    mov outclr, r0
+    emit 
+    setemit 2, prim
+    mov outpos, v0
+    mov outclr, r0
+    emit 
+    setemit 2, prim inv 
+    mov outpos, v6
+    mov outclr, r0
+    emit
+
+    ; +y face 
+
+    setemit 1
+    mov outpos, v14
+    mov outclr, r0
+    emit 
+
+    setemit 2, prim
+    mov outpos, v6
+    mov outclr, r0
+    emit 
+
+    setemit 2, prim inv
+    mov outpos, v12
+    mov outclr, r0
+    emit 
+
+    end
+.end

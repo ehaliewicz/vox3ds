@@ -1,0 +1,1752 @@
+#include <3ds.h>
+#include <citro3d.h>
+#include <citro2d.h>
+#include <tex3ds.h>
+#include <string.h>
+#include "vshader_shbin.h"
+#include "skybox_shbin.h"
+#include "atlas_t3x.h"
+#include "normal_atlas_t3x.h"
+#include "skybox_t3x.h"
+
+
+int VRAM_TOTAL = 0;
+void mmLogVRAM() {
+	printf("VRAM: %d / %d kB\n", (VRAM_TOTAL - vramSpaceFree()) / 1024, VRAM_TOTAL / 1024);
+}
+
+bool mmIsVRAM(void *addr) {
+	u32 vaddr = (u32)addr;
+	return vaddr >= 0x1F000000 && vaddr < 0x1F600000;
+}
+
+
+void assert(int i, int line) {
+	if(!i) {
+		printf("Assertion failed on line %i\n", line);
+		while(1) { }
+	}
+}
+
+void mmCopy(void *dst, void *src, size_t size) {
+	if (mmIsVRAM(dst)) {
+		GSPGPU_FlushDataCache(src, size);
+		GX_RequestDma((u32*)src, (u32*)dst, size);
+		gspWaitForDMA();
+	} else {
+		memcpy(dst, src, size);
+		GSPGPU_FlushDataCache(dst, size);
+	}
+}
+
+void* mmAlloc(size_t size) {
+	printf("Allocating %i bytes of vram\n",  size);
+	void *addr = vramAlloc(size);
+	if (!addr) {
+		printf("! OUT OF VRAM %d < %d\n", vramSpaceFree() / 1024, size / 1024);
+		addr = linearAlloc(size);
+		assert(addr != NULL, __LINE__);
+	} else {
+		mmLogVRAM();
+	}
+	return addr;
+}
+
+static C3D_BufInfo* bufInfo;
+
+#define CLEAR_COLOR 0x68B0D8FF
+
+#define DISPLAY_TRANSFER_FLAGS \
+	(GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) | \
+	GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8) | \
+	GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO))
+
+
+// 32 bytes
+typedef struct { float position[3]; float texcoord[2]; float normal[3]; } vertex; //float tangent[3]; 
+// 23 bytes
+
+// 8 bytes
+// 4 bytes
+typedef struct { u8 position[3]; u8 material[1]; } gpu_vertex; // float normal[3]; } gpu_vertex; 
+
+typedef struct { u8 position[3]; u8 rgba[3]; } gpu_lod_vertex;
+
+unsigned char rndtable[256] = {
+    0,   8, 109, 220, 222, 241, 149, 107,  75, 248, 254, 140,  16,  66 ,
+    74,  21, 211,  47,  80, 242, 154,  27, 205, 128, 161,  89,  77,  36 ,
+    95, 110,  85,  48, 212, 140, 211, 249,  22,  79, 200,  50,  28, 188 ,
+    52, 140, 202, 120,  68, 145,  62,  70, 184, 190,  91, 197, 152, 224 ,
+    149, 104,  25, 178, 252, 182, 202, 182, 141, 197,   4,  81, 181, 242 ,
+    145,  42,  39, 227, 156, 198, 225, 193, 219,  93, 122, 175, 249,   0 ,
+    175, 143,  70, 239,  46, 246, 163,  53, 163, 109, 168, 135,   2, 235 ,
+    25,  92,  20, 145, 138,  77,  69, 166,  78, 176, 173, 212, 166, 113 ,
+    94, 161,  41,  50, 239,  49, 111, 164,  70,  60,   2,  37, 171,  75 ,
+    136, 156,  11,  56,  42, 146, 138, 229,  73, 146,  77,  61,  98, 196 ,
+    135, 106,  63, 197, 195,  86,  96, 203, 113, 101, 170, 247, 181, 113 ,
+    80, 250, 108,   7, 255, 237, 129, 226,  79, 107, 112, 166, 103, 241 ,
+    24, 223, 239, 120, 198,  58,  60,  82, 128,   3, 184,  66, 143, 224 ,
+    145, 224,  81, 206, 163,  45,  63,  90, 168, 114,  59,  33, 159,  95 ,
+    28, 139, 123,  98, 125, 196,  15,  70, 194, 253,  54,  14, 109, 226 ,
+    71,  17, 161,  93, 186,  87, 244, 138,  20,  52, 123, 251,  26,  36 ,
+    17,  46,  52, 231, 232,  76,  31, 221,  84,  37, 216, 165, 212, 106 ,
+    197, 242,  98,  43,  39, 175, 254, 145, 190,  84, 118, 222, 187, 136 ,
+    120, 163, 236, 249
+};
+
+int rndindex = 0;
+
+uint16_t random(void) {
+	//static uint16_t start_state = 0xACE1u;  /* Any nonzero start state will work. */
+    static uint16_t lfsr = 0xACE1u;
+    uint16_t bit;                    /* Must be 16-bit to allow bit<<15 later in the code */
+
+    
+    /* taps: 16 14 13 11; feedback polynomial: x^16 + x^14 + x^13 + x^11 + 1 */
+	bit = ((lfsr >> 0) ^ (lfsr >> 2) ^ (lfsr >> 3) ^ (lfsr >> 5)) & 1u;
+	lfsr = (lfsr >> 1) | (bit << 15);
+	return lfsr;
+
+}
+
+
+void ClearRandom (void)
+{
+    rndindex = 0;
+}
+
+typedef enum {
+	AIR=0,
+	DIRT=1,
+	STONE=2,
+	OBSIDIAN=3,
+	WOOD=4,
+	COAL_ORE=5
+} BLOCK_TYPE;
+
+
+C3D_FVec block_col[6] = {
+	{.x = 0.0f,.y = 0.0f, .z = 0.0f, .w = 0.0f}, // AIR
+	{.x = .21f,.y = .15f, .z = .07f, .w = 1.0f}, // DIRT
+	{.x = .42f,.y = .39f, .z = .35f, .w = 1.0f}, // STONE
+	{.x = .09f,.y = .07f, .z = .13f, .w = 1.0f}, // OBSIDIAN
+	{.x = .21f,.y = .15f, .z = .07f, .w = 1.0f}, // WOOD
+	{.x = .39f,.y = .39f, .z = .39f, .w = 1.0f}, // COAL_ORE
+};
+
+#define NUM_MATERIALS 6
+
+typedef struct {
+	float u1;
+	float u2;
+	float v1;
+	float v2;
+} mat_uv;
+
+
+#define TWELFTH (1.0f/(12.0f))
+#define TWO_TWELFTHS (2.0f/(12.0f))
+mat_uv material_uvs[NUM_MATERIALS];
+
+#define CHUNK_WIDTH 32
+#define CHUNK_DEPTH 32
+#define CHUNK_HEIGHT 32
+
+#define CHUNK_SIZE (CHUNK_WIDTH*CHUNK_HEIGHT*CHUNK_DEPTH) // 8192 cubes
+#define LOD1_CHUNK_SIZE (CHUNK_SIZE/8) // 1024 cubes
+#define LOD2_CHUNK_SIZE (LOD1_CHUNK_SIZE/8) // 128 cubes
+#define LOD3_CHUNK_SIZE (LOD2_CHUNK_SIZE/8)
+
+//#define MAX_TRIS (CHUNK_SIZE*6*2) // 98k TRIANGLES!
+
+// maybe 36k verts on average 
+// at LOD1 it's only 9k
+// at LOD2 it's only 2k
+#define FACES_IN_CHUNK (CHUNK_SIZE*6)
+#define VERTS_PER_FACE 4
+
+// 98k verts vs 149k
+// each is still 11 floats, 44 bytes
+// 4MB vbo + 196kB index buffer
+//#define MAX_VERTS (FACES_IN_CHUNK*VERTS_PER_FACE)
+#define MAX_VERTS (FACES_IN_CHUNK*VERTS_PER_FACE)
+#define OPTIMIZED_MAX_VERTS (CHUNK_SIZE*8)
+
+int num_verts = 0;
+
+// 36 vertexes in a cube
+
+typedef struct {
+	float x,y,z;
+} vec3f;
+
+static const vec3f face_normals[6] = {
+	{0.0f, 0.0f, +1.0f},
+	{0.0f, 0.0f, -1.0f},
+	{+1.0f, 0.0f, 0.0f},
+	{-1.0f, 0.0f, 0.0f},
+	{0.0f, +1.0f, 0.0f},
+	{0.0f, -1.0f, 0.0f}
+};
+static const vec3f face_tangents[6] = {
+	{+1.0f, 0.0f, 0.0f},
+	{0.0f, +1.0f, 0.0f},
+	{0.0f, +1.0f, 0.0f},
+
+	{0.0f, 0.0f, +1.0f},
+	{0.0f, 0.0f, +1.0f},
+	{+1.0f, 0.0f, 0.0f},
+};
+
+#define CUBE_VERTS 36
+
+
+// 0  1  2  3
+// 0, 1, 2, 4
+// output indexes are 
+// 0,1,2  2,4,0
+static const vertex cube_vert_list[CUBE_VERTS] = {
+	// First face (PZ)
+	// First triangle
+	
+	{ {0.0f, 0.0f, 1.0f}, {0.0f, 0.0f}, {0.0f, 0.0f, +1.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	{ {+1.0f, 0.0f, 1.0f}, {1.0f, 0.0f}, {0.0f, 0.0f, +1.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	{ {+1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}, {0.0f, 0.0f, +1.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	// Second triangle
+	{ {+1.0f, +1.0f, 1.0f}, {1.0f, 1.0f}, {0.0f, 0.0f, +1.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	{ {-0.0f, +1.0f, 1.0f}, {0.0f, 1.0f}, {0.0f, 0.0f, +1.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	{ {-0.0f, -0.0f, 1.0f}, {0.0f, 0.0f}, {0.0f, 0.0f, +1.0f} }, //, {0.0f, 0.0f, +1.0f} },
+
+	// Second face (MZ)
+	// First triangle
+	{ {-0.0f, -0.0f, -0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f, -1.0f} }, //, {0.0f, +1.0f, 0.0f} },
+	{ {-0.0f, +1.0f, -0.0f}, {1.0f, 0.0f}, {0.0f, 0.0f, -1.0f} }, //, {0.0f, +1.0f, 0.0f} },
+	{ {+1.0f, +1.0f, -0.0f}, {1.0f, 1.0f}, {0.0f, 0.0f, -1.0f} }, //, {0.0f, +1.0f, 0.0f} },
+	// Second triangle
+	{ {+1.0f, +1.0f, -0.0f}, {1.0f, 1.0f}, {0.0f, 0.0f, -1.0f} }, //, {0.0f, +1.0f, 0.0f} },
+	{ {+1.0f, -0.0f, -0.0f}, {0.0f, 1.0f}, {0.0f, 0.0f, -1.0f} }, //, {0.0f, +1.0f, 0.0f} },
+	{ {-0.0f, -0.0f, -0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f, -1.0f} }, //, {0.0f, +1.0f, 0.0f} },
+
+	// Third face (PX)
+	// First triangle
+	{ {+1.0f, -0.0f, -0.0f}, {0.0f, 0.0f}, {+1.0f, 0.0f, 0.0f} }, //, {0.0f, +1.0f, 0.0f} },
+	{ {+1.0f, +1.0f, -0.0f}, {1.0f, 0.0f}, {+1.0f, 0.0f, 0.0f} }, //, {0.0f, +1.0f, 0.0f} },
+	{ {+1.0f, +1.0f, +1.0f}, {1.0f, 1.0f}, {+1.0f, 0.0f, 0.0f} }, //, {0.0f, +1.0f, 0.0f} },
+	// Second triangle
+	{ {+1.0f, +1.0f, +1.0f}, {1.0f, 1.0f}, {+1.0f, 0.0f, 0.0f} }, //, {0.0f, +1.0f, 0.0f} },
+	{ {+1.0f, -0.0f, +1.0f}, {0.0f, 1.0f}, {+1.0f, 0.0f, 0.0f} }, //, {0.0f, +1.0f, 0.0f} },
+	{ {+1.0f, -0.0f, -0.0f}, {0.0f, 0.0f}, {+1.0f, 0.0f, 0.0f} }, //, {0.0f, +1.0f, 0.0f} },
+
+	// Fourth face (MX)
+	// First triangle
+	{ {-0.0f, -0.0f, -0.0f}, {0.0f, 0.0f}, {-1.0f, 0.0f, 0.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	{ {-0.0f, -0.0f, +1.0f}, {1.0f, 0.0f}, {-1.0f, 0.0f, 0.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	{ {-0.0f, +1.0f, +1.0f}, {1.0f, 1.0f}, {-1.0f, 0.0f, 0.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	// Second triangle
+	{ {-0.0f, +1.0f, +1.0f}, {1.0f, 1.0f}, {-1.0f, 0.0f, 0.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	{ {-0.0f, +1.0f, -0.0f}, {0.0f, 1.0f}, {-1.0f, 0.0f, 0.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	{ {-0.0f, -0.0f, -0.0f}, {0.0f, 0.0f}, {-1.0f, 0.0f, 0.0f} }, //, {0.0f, 0.0f, +1.0f} },
+
+	// Fifth face (PY)
+	// First triangle
+	{ {-0.0f, +1.0f, -0.0f}, {0.0f, 0.0f}, {0.0f, +1.0f, 0.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	{ {-0.0f, +1.0f, +1.0f}, {1.0f, 0.0f}, {0.0f, +1.0f, 0.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	{ {+1.0f, +1.0f, +1.0f}, {1.0f, 1.0f}, {0.0f, +1.0f, 0.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	// Second triangle
+	{ {+1.0f, +1.0f, +1.0f}, {1.0f, 1.0f}, {0.0f, +1.0f, 0.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	{ {+1.0f, +1.0f, -0.0f}, {0.0f, 1.0f}, {0.0f, +1.0f, 0.0f} }, //, {0.0f, 0.0f, +1.0f} },
+	{ {-0.0f, +1.0f, -0.0f}, {0.0f, 0.0f}, {0.0f, +1.0f, 0.0f} }, //, {0.0f, 0.0f, +1.0f} },
+
+	// Sixth face (MY)
+	// First triangle
+	{ {-0.0f, -0.0f, -0.0f}, {0.0f, 0.0f}, {0.0f, -1.0f, 0.0f} }, //, {+1.0f, 0.0f, 0.0f} },
+	{ {+1.0f, -0.0f, -0.0f}, {1.0f, 0.0f}, {0.0f, -1.0f, 0.0f} }, //, {+1.0f, 0.0f, 0.0f} },
+	{ {+1.0f, -0.0f, +1.0f}, {1.0f, 1.0f}, {0.0f, -1.0f, 0.0f} }, //, {+1.0f, 0.0f, 0.0f} },
+	// Second triangle
+	{ {+1.0f, -0.0f, +1.0f}, {1.0f, 1.0f}, {0.0f, -1.0f, 0.0f} }, //, {+1.0f, 0.0f, 0.0f} },
+	{ {-0.0f, -0.0f, +1.0f}, {0.0f, 1.0f}, {0.0f, -1.0f, 0.0f} }, //, {+1.0f, 0.0f, 0.0f} },
+	{ {-0.0f, -0.0f, -0.0f}, {0.0f, 0.0f}, {0.0f, -1.0f, 0.0f} }, //, {+1.0f, 0.0f, 0.0f} },
+};
+
+
+
+#define BLOCK_INDEX_MASK 0b1
+#define BLOCKS_PER_BYTE 2
+#define BLOCK_BIT_MASK 0b1111
+#define BITS_PER_BLOCK 4
+
+typedef struct {
+	vertex level_0_vertexes[CHUNK_WIDTH*CHUNK_HEIGHT*CHUNK_DEPTH]; // 8192 cubes
+	vertex level_1_vertexes[CHUNK_WIDTH/2*CHUNK_HEIGHT/2*CHUNK_DEPTH/2]; // 1024 cubes
+	vertex level_2_vertexes[CHUNK_WIDTH/2*CHUNK_HEIGHT/2*CHUNK_DEPTH/2]; // 128 cubes
+} chunk_verts;
+
+typedef struct {
+	// 2kB per chunk
+	u8 block_type[32768];
+	u8 has_been_modified;
+	C3D_FVec base_pos; // (bottom left front position)
+	C3D_FVec max_pos;
+	int vertex_buffer_offset;
+	int num_verts, num_indexes;
+	int lod1_num_verts, lod1_num_indexes;
+	gpu_vertex* vertex_buffer;
+	gpu_lod_vertex* lod1_vertex_buffer;
+	u16* index_buffer;
+} chunk;
+
+u32 get_block_idx(int x, int y, int z) {
+	return (y*CHUNK_WIDTH*CHUNK_DEPTH + x*CHUNK_DEPTH + z);
+}
+
+u8 get_block_type(chunk* c, u8 x, u8 y, u8 z) {
+	
+	u32 block_index = get_block_idx(x,y,z);
+	u32 byte_index = block_index / BLOCKS_PER_BYTE;
+	u32 crumb_index = block_index & BLOCK_INDEX_MASK;
+	u32 scaled_crumb_index = crumb_index * BITS_PER_BLOCK;
+	return ((c->block_type[byte_index] & (BLOCK_BIT_MASK << scaled_crumb_index)) >> scaled_crumb_index);
+}
+
+u8 get_is_block_solid(chunk* c, u8 x, u8 y, u8 z) {
+	return get_block_type(c, x, y, z) != AIR;
+}
+
+u8 get_is_block_empty(chunk* c, u8 x, u8 y, u8 z) {
+	return get_block_type(c, x, y, z) == AIR;
+}
+
+void delete_voxel_at_block_idx(chunk* c, int block_index) {
+	u32 byte_index = block_index / BLOCKS_PER_BYTE;
+	u32 crumb_index = block_index & BLOCK_INDEX_MASK;
+	u32 scaled_crumb_index = crumb_index * BITS_PER_BLOCK;
+	c->block_type[byte_index] &= ~(BLOCK_BIT_MASK<<scaled_crumb_index);
+}
+
+void set_voxel_at(chunk* c, u8 x, u8 y, u8 z, u8 type) {
+	u32 block_index = get_block_idx(x, y, z);
+	u32 byte_index = block_index / BLOCKS_PER_BYTE;
+	u32 crumb_index = block_index & BLOCK_INDEX_MASK;
+	u32 scaled_crumb_index = crumb_index * BITS_PER_BLOCK;
+	c->block_type[byte_index] |= (type<<scaled_crumb_index);
+}
+
+// returns -1 if not inside chunk
+int raycast_to_first_solid_chunk(chunk* chk, C3D_FVec ray_origin, C3D_FVec ray_dir) {
+	//ray_dir.z = -ray_dir.z;
+	C3D_FVec aabb_min_minus_ray = FVec3_Subtract(chk->base_pos, ray_origin);
+	C3D_FVec aabb_max_minus_ray = FVec3_Subtract(chk->max_pos, ray_origin);
+
+	float t1 = aabb_min_minus_ray.x / ray_dir.x;
+    float t2 = aabb_max_minus_ray.x / ray_dir.x;
+    float tmin = fminf(t1, t2);
+    float tmax = fmaxf(t1, t2);
+
+    t1 = aabb_min_minus_ray.y / ray_dir.y;
+    t2 = aabb_max_minus_ray.y / ray_dir.y;
+    tmin = fmaxf(tmin, fminf(t1, t2));
+    tmax = fminf(tmax, fmaxf(t1, t2));
+
+    t1 = aabb_min_minus_ray.z / ray_dir.z;
+    t2 = aabb_max_minus_ray.z / ray_dir.z;
+    tmin = fmaxf(tmin, fminf(t1, t2));
+    tmax = fminf(tmax, fmaxf(t1, t2));
+
+    if (tmax < 0 || tmin > tmax) {
+        return -1; // no intersection
+	}
+
+	float t_near = tmin; // distance along the ray where it enters the aabb
+	float t_far = tmax; // distance along the ray where it exits the aabb
+	if(t_near < 0) {
+		t_near = 0.0f;
+	}
+	C3D_FVec start_pos = FVec3_Add(ray_origin, FVec3_Scale(ray_dir, t_near));
+	C3D_FVec local_pos = FVec3_Subtract(start_pos, chk->base_pos);
+
+
+
+	// Starting voxel	
+    int x = (int)floor(local_pos.x);
+    int y = (int)floor(local_pos.y);
+    int z = (int)floor(local_pos.z);
+	//printf("local position %i,%i,%i\n", x,y,z);
+
+    // Steps
+    int stepX = (ray_dir.x > 0) ? 1 : -1;
+    int stepY = (ray_dir.y > 0) ? 1 : -1;
+    int stepZ = (ray_dir.z > 0) ? 1 : -1;
+
+    // tMax = distance along ray to next voxel boundary
+    float tMaxX = ((stepX > 0 ? (x+1) : x) - local_pos.x) / ray_dir.x;
+    float tMaxY = ((stepY > 0 ? (y+1) : y) - local_pos.y) / ray_dir.y;
+    float tMaxZ = ((stepZ > 0 ? (z+1) : z) - local_pos.z) / ray_dir.z;
+
+    // tDelta = how far we must travel along ray to cross a voxel
+    float tDeltaX = 1.0f / fabs(ray_dir.x);
+    float tDeltaY = 1.0f / fabs(ray_dir.y);
+    float tDeltaZ = 1.0f / fabs(ray_dir.z);
+
+	// step until we're fully inside the chunk
+	/*
+	while(x == CHUNK_WIDTH || y == CHUNK_HEIGHT || z == CHUNK_DEPTH) {
+        // Step to next voxel
+        if (tMaxX < tMaxY)
+        {
+            if (tMaxX < tMaxZ)
+            {
+                tMaxX += tDeltaX;
+                x += stepX;
+            }
+            else
+            {
+                tMaxZ += tDeltaZ;
+                z += stepZ;
+            }
+        }
+        else
+        {
+            if (tMaxY < tMaxZ)
+            {
+                tMaxY += tDeltaY;
+                y += stepY;
+            }
+            else
+            {
+                tMaxZ += tDeltaZ;
+                z += stepZ;
+            }
+        }
+	}
+		*/
+
+    // Traverse until out of chunk bounds
+    while (x >= 0 && x <= CHUNK_WIDTH &&
+           y >= 0 && y <= CHUNK_HEIGHT &&
+           z >= 0 && z <= CHUNK_DEPTH)
+    {
+		if(x < CHUNK_WIDTH && y < CHUNK_HEIGHT && z < CHUNK_DEPTH && get_is_block_solid(chk, x,y,z)) {
+			return get_block_idx(x,y,z);
+        }
+
+        // Step to next voxel
+        if (tMaxX < tMaxY)
+        {
+            if (tMaxX < tMaxZ)
+            {
+                tMaxX += tDeltaX;
+                x += stepX;
+            }
+            else
+            {
+                tMaxZ += tDeltaZ;
+                z += stepZ;
+            }
+        }
+        else
+        {
+            if (tMaxY < tMaxZ)
+            {
+                tMaxY += tDeltaY;
+                y += stepY;
+            }
+            else
+            {
+                tMaxZ += tDeltaZ;
+                z += stepZ;
+            }
+        }
+    }
+
+    return -1;
+}
+
+
+//chunk test_chunk;
+
+// 56x56x32 (7x7 chunks)
+#define NUM_CHUNKS_X 3
+#define NUM_CHUNKS_Z 3
+#define NUM_CHUNKS (NUM_CHUNKS_X*NUM_CHUNKS_Z)
+
+chunk in_memory_chunks[NUM_CHUNKS];
+/*
+33333333
+32222223
+32111223
+32100123
+32100122
+32111123
+3333333
+*/
+
+/*
+int vertex_positions[33][2][3] = {
+	// front face positions (32 vox)
+	{0,0,0}, {1,0,0}, 
+	{0,1,0}, {1,1,0}, 
+	{0,2,0}, {1,2,0},
+	{0,3,0}, {1,3,0},
+	{0,4,0}, {1,4,0},
+	{0,5,0}, {1,5,0},
+	{0,6,0}, {1,6,0},
+	{0,7,0}, {1,7,0},
+	{0,8,0}, {1,8,0},
+	{0,9,0}, {1,9,0},
+	{0,10,0}, {1,10,0},
+	{0,11,0}, {1,11,0},
+	{0,12,0}, {1,12,0},
+	{0,13,0}, {1,13,0},
+	{0,14,0}, {1,14,0},
+	{0,15,0}, {1,15,0},
+	{0,16,0}, {1,16,0},
+	{0,17,0}, {1,17,0},
+	{0,18,0}, {1,18,0},
+	{0,19,0}, {1,19,0},
+	{0,20,0}, {1,20,0},
+	{0,21,0}, {1,21,0},
+	{0,22,0}, {1,22,0},
+	{0,23,0}, {1,23,0},
+	{0,24,0}, {1,24,0},
+	{0,25,0}, {1,25,0},
+	{0,26,0}, {1,26,0},
+	{0,27,0}, {1,27,0},
+	{0,28,0}, {1,28,0},
+	{0,29,0}, {1,29,0},
+	{0,30,0}, {1,30,0},
+	{0,31,0}, {1,31,0},
+	{0,31,0}, {1,32,0},
+};
+*/
+
+
+int allocated_lod0 = 0;
+int allocated_lod1 = 0;
+gpu_vertex* lod0_chunk_pointers[NUM_CHUNKS] = { NULL };
+//gpu_lod_vertex* lod1_chunk_pointers[1] = { NULL };
+
+void init_chunk_pointers() {
+	for(int i = 0; i < NUM_CHUNKS; i++) {
+		lod0_chunk_pointers[i] = mmAlloc(OPTIMIZED_MAX_VERTS*sizeof(gpu_vertex));
+	}
+	//for(int i = 0; i < 0; i++) {
+	//	lod1_chunk_pointers[i] = linearAlloc(MAX_VERTS/8*sizeof(gpu_lod_vertex));
+	//}
+}
+
+gpu_vertex* get_lod0_chunk_pointer() {
+	if(allocated_lod0 < NUM_CHUNKS) {
+		return lod0_chunk_pointers[allocated_lod0++];
+	}
+	return NULL;
+}
+
+gpu_lod_vertex* get_lod1_chunk_pointer() {
+	//if(allocated_lod1 < 0) {
+		//return lod1_chunk_pointers[allocated_lod1++];
+	//}
+	return NULL;
+}
+
+typedef struct {
+	float max_chance;
+	u8 type;
+} prob;
+// ranges 
+typedef struct {
+	u8 max_y;
+	int num_probs;
+	prob probs[10]; // up to 10 possibilities
+} gen_range;
+gen_range ranges[] = {
+	{
+		.max_y = 1, 
+		.num_probs = 1, 
+		.probs = {
+			{1.0f, OBSIDIAN},
+		}
+	},
+	{
+		.max_y = 4,
+		.num_probs = 3,
+		.probs = {
+			{0.90f, STONE},
+			{0.92f, COAL_ORE},
+			{1.0f, DIRT}
+		}
+	},
+	{
+		.max_y = 25,
+		.num_probs = 3,
+		.probs = {
+			{0.65f, DIRT},
+			{0.67f, COAL_ORE},
+			{1.0f, STONE}
+		}
+	},
+	{
+		.max_y = 31,
+		.num_probs = 3,
+		.probs = {
+			{0.55f, AIR},
+			{0.75f, DIRT},
+			{0.85f, STONE},
+			{1.0f, WOOD},
+		}
+	}
+};
+#define NUM_RANGES 4
+
+
+void init_chunk(chunk* c, C3D_FVec base_pos) {
+	//sslcGenerateRandomData(c->block_type, sizeof(c->block_type));
+	gpu_vertex* lod0_ptr = get_lod0_chunk_pointer();
+	if(lod0_ptr == NULL) {
+		c->vertex_buffer = NULL;
+		c->lod1_vertex_buffer = get_lod1_chunk_pointer();
+	} else {
+		c->vertex_buffer = lod0_ptr;
+		c->lod1_vertex_buffer = get_lod1_chunk_pointer();
+	}
+
+	c->num_verts = 0;
+	c->num_indexes = 0;
+	c->lod1_num_verts = 0;
+	c->lod1_num_indexes = 0;
+
+	memset(c->block_type, 0x00, sizeof(c->block_type));
+	for(int y = 0; y < CHUNK_HEIGHT; y++) {
+		gen_range cur_range = ranges[NUM_RANGES-1];
+		int range_idx;
+		for(range_idx = 0; range_idx < NUM_RANGES; range_idx++) {
+			if(y <= ranges[range_idx].max_y) {
+				cur_range = ranges[range_idx];
+				break;
+			}
+		}
+		for(int x = 0; x < CHUNK_WIDTH; x++) {
+			for(int z = 0; z < CHUNK_DEPTH; z++) {
+				float f = (random()%100)/100.0f;
+				u8 type = AIR;
+				for(int p = 0; p < cur_range.num_probs; p++) {
+					if(f <= cur_range.probs[p].max_chance) {
+						type = cur_range.probs[p].type;
+						break;
+					}
+				}
+				if(range_idx == 3) {
+					//printf("num probs %i\n", cur_range.num_probs);
+				}
+				if(type == AIR) {
+					//printf("got air");
+				} else {
+					set_voxel_at(c, x, y, z, type);
+				}
+			}
+		}
+	}
+	//memset(c->block_type, 0b1110000, sizeof(c->block_type));
+	c->has_been_modified = 1;
+	c->base_pos = base_pos;
+	//printf("Initting chunk at %f,%f%f\n", base_pos.x, base_pos.y, base_pos.z);
+	c->max_pos.x = base_pos.x + CHUNK_WIDTH;
+	c->max_pos.y = base_pos.y + CHUNK_HEIGHT;
+	c->max_pos.z = base_pos.z + CHUNK_DEPTH;
+}
+
+C3D_FVec FVec3_AddWithW(C3D_FVec a, C3D_FVec b) {
+	return ((C3D_FVec){.x = a.x+b.x, .y = a.y+b.y, .z = a.z+b.z, .w = a.w + b.w});
+}
+
+u16* chunk_index_buffer = NULL;
+
+void* vram_index_buffer = NULL;
+
+void mesh_chunk_lod1(chunk* chk) {
+	
+	int vert_idx = 0;
+	int index_idx = 0;
+	gpu_lod_vertex* vertex_buffer = chk->lod1_vertex_buffer;
+	return;
+
+	for(int cube_face = 0; cube_face < 6; cube_face++) {
+							
+		int LOD1_CHUNK_HEIGHT = CHUNK_HEIGHT/2;
+		int LOD1_CHUNK_WIDTH = CHUNK_WIDTH/2;
+		int LOD1_CHUNK_DEPTH = CHUNK_DEPTH/2;
+		for(int y = 0; y < LOD1_CHUNK_HEIGHT; y++) {
+			u8 is_edge_y = ((y == 0) || (y == LOD1_CHUNK_HEIGHT-1)) ? 1 : 0;
+			for(int x = 0; x < LOD1_CHUNK_WIDTH; x++) {
+				u8 is_edge_x = ((x == 0) || (x == LOD1_CHUNK_WIDTH-1)) ? 1 : 0;
+				for(int z = 0; z < LOD1_CHUNK_DEPTH; z++) {
+					int scaled_x = x*2;
+					int scaled_y = y*2;
+					int scaled_z = z*2;
+
+					u8 is_edge_z = ((z == 0) || (z == LOD1_CHUNK_DEPTH-1)) ? 1 : 0;
+
+					u8 block_type0 = get_block_type(chk, scaled_x,   scaled_y,   scaled_z);
+					u8 block_type1 = get_block_type(chk, scaled_x+1, scaled_y,   scaled_z);
+					u8 block_type2 = get_block_type(chk, scaled_x,   scaled_y+1, scaled_z);
+					u8 block_type3 = get_block_type(chk, scaled_x+1, scaled_y+1, scaled_z);
+					u8 block_type4 = get_block_type(chk, scaled_x,   scaled_y,   scaled_z+1);
+					u8 block_type5 = get_block_type(chk, scaled_x+1, scaled_y,   scaled_z+1);
+					u8 block_type6 = get_block_type(chk, scaled_x,   scaled_y+1, scaled_z+1);
+					u8 block_type7 = get_block_type(chk, scaled_x+1, scaled_y+1, scaled_z+1);
+					u8 block = block_type0 + block_type1 + block_type2 + block_type3 + block_type4 + 
+						      block_type5 + block_type6 + block_type7;
+					C3D_FVec sum = {.x=0,.y=0,.z=0,.w=0};
+					sum = FVec3_AddWithW(sum, block_col[block_type0]);
+					sum = FVec3_AddWithW(sum, block_col[block_type1]);
+					sum = FVec3_AddWithW(sum, block_col[block_type2]);
+					sum = FVec3_AddWithW(sum, block_col[block_type3]);
+					sum = FVec3_AddWithW(sum, block_col[block_type4]);
+					sum = FVec3_AddWithW(sum, block_col[block_type5]);
+					sum = FVec3_AddWithW(sum, block_col[block_type6]);
+					sum = FVec3_AddWithW(sum, block_col[block_type7]);
+					float avgx = sum.x/8.0f;
+					float avgy = sum.y/8.0f;
+					float avgz = sum.z/8.0f;
+					float avgw = sum.w/8.0f;
+
+					u8 has_solid_block = block != AIR;
+					if(!has_solid_block) { continue; }
+
+					u8 is_visible = (is_edge_x | is_edge_y | is_edge_z) ? 1 : 0;
+					if(!is_visible) {
+						// test neighboring bytes 
+						if(z > 0) {
+							is_visible |= get_is_block_empty(chk,scaled_x,  scaled_y,scaled_z-1);
+							is_visible |= get_is_block_empty(chk,scaled_x+1,scaled_y,scaled_z-1);
+							is_visible |= get_is_block_empty(chk,scaled_x,  scaled_y+1,scaled_z-1);
+							is_visible |= get_is_block_empty(chk,scaled_x+1,scaled_y+1,scaled_z-1);
+						} 
+						if (z < LOD1_CHUNK_DEPTH) {
+							is_visible |= get_is_block_empty(chk,scaled_x,scaled_y,scaled_z+1);
+							is_visible |= get_is_block_empty(chk,scaled_x+1,scaled_y,scaled_z+1);
+							is_visible |= get_is_block_empty(chk,scaled_x,scaled_y+1,scaled_z+1);
+							is_visible |= get_is_block_empty(chk,scaled_x+1,scaled_y+1,scaled_z+1);
+						}
+
+						if(y > 0) {
+							is_visible |= get_is_block_empty(chk,scaled_x,scaled_y-1,scaled_z);
+							is_visible |= get_is_block_empty(chk,scaled_x+1,scaled_y-1,scaled_z);
+							is_visible |= get_is_block_empty(chk,scaled_x,scaled_y-1,scaled_z+1);
+							is_visible |= get_is_block_empty(chk,scaled_x+1,scaled_y-1,scaled_z+1);
+						}
+						if (y < LOD1_CHUNK_HEIGHT) {
+							is_visible |= get_is_block_empty(chk,scaled_x,scaled_y+1,scaled_z);
+							is_visible |= get_is_block_empty(chk,scaled_x+1,scaled_y+1,scaled_z);
+							is_visible |= get_is_block_empty(chk,scaled_x,scaled_y+1,scaled_z+1);
+							is_visible |= get_is_block_empty(chk,scaled_x+1,scaled_y+1,scaled_z+1);
+						}
+
+						if(x > 0) {
+							is_visible |= get_is_block_empty(chk,scaled_x-1,scaled_y,scaled_z);
+							is_visible |= get_is_block_empty(chk,scaled_x-1,scaled_y+1,scaled_z);
+							is_visible |= get_is_block_empty(chk,scaled_x-1,scaled_y,scaled_z+1);
+							is_visible |= get_is_block_empty(chk,scaled_x-1,scaled_y+1,scaled_z+1);
+						} 
+						if (z < LOD1_CHUNK_WIDTH) {
+							is_visible |= get_is_block_empty(chk,scaled_x+1,scaled_y,scaled_z);
+							is_visible |= get_is_block_empty(chk,scaled_x+1,scaled_y+1,scaled_z);
+							is_visible |= get_is_block_empty(chk,scaled_x+1,scaled_y,scaled_z+1);
+							is_visible |= get_is_block_empty(chk,scaled_x+1,scaled_y+1,scaled_z+1);
+						}
+					}
+
+					if(!is_visible) { continue; }
+
+					mat_uv block_uvs = material_uvs[STONE];
+
+					//c->has_block[]
+					vertex *base_vert = &cube_vert_list[cube_face*6 + 0];
+					float v0x = base_vert->position[0]*2 + scaled_x;
+					float v0y = base_vert->position[1]*2 + scaled_y;
+					float v0z = base_vert->position[2]*2 + scaled_z;
+				
+					base_vert = &cube_vert_list[cube_face*6 + 1];
+					float v1x = base_vert->position[0]*2 + scaled_x;
+					float v1y = base_vert->position[1]*2 + scaled_y;
+					float v1z = base_vert->position[2]*2 + scaled_z;
+				
+					base_vert = &cube_vert_list[cube_face*6 + 2];
+					float v2x = base_vert->position[0]*2 + scaled_x;
+					float v2y = base_vert->position[1]*2 + scaled_y;
+					float v2z = base_vert->position[2]*2 + scaled_z;
+				
+					base_vert = &cube_vert_list[cube_face*6 + 4];
+					float v3x = base_vert->position[0]*2 + scaled_x;
+					float v3y = base_vert->position[1]*2 + scaled_y;
+					float v3z = base_vert->position[2]*2 + scaled_z;
+
+				
+					
+					gpu_lod_vertex *out_vert = &vertex_buffer[vert_idx];
+					out_vert->position[0] = v0x;
+					out_vert->position[1] = v0y;
+					out_vert->position[2] = v0z;
+					out_vert->rgba[0] = avgx*255.0f;
+					out_vert->rgba[1] = avgy*255.0f;
+					out_vert->rgba[2] = avgz*255.0f;
+
+
+					out_vert = &vertex_buffer[vert_idx+1];
+					out_vert->position[0] = v1x;
+					out_vert->position[1] = v1y;
+					out_vert->position[2] = v1z;
+					out_vert->rgba[0] = avgx*255.0f;
+					out_vert->rgba[1] = avgy*255.0f;
+					out_vert->rgba[2] = avgz*255.0f;
+
+					out_vert = &vertex_buffer[vert_idx+2];
+					out_vert->position[0] = v2x;
+					out_vert->position[1] = v2y;
+					out_vert->position[2] = v2z;
+					out_vert->rgba[0] = avgx*255.0f;
+					out_vert->rgba[1] = avgy*255.0f;
+					
+					out_vert = &vertex_buffer[vert_idx+3];
+					out_vert->position[0] = v3x;
+					out_vert->position[1] = v3y;
+					out_vert->position[2] = v3z;
+					out_vert->rgba[0] = avgx*255.0f;
+					out_vert->rgba[1] = avgy*255.0f;
+					out_vert->rgba[2] = avgz*255.0f;
+					vert_idx += 4;
+
+					//if(z != 0) {
+						// insert degenerates
+						//chunk_index_buffer[index_idx++] = 0xFFFF;
+
+					//}
+
+					//chunk_index_buffer[index_idx++] = vert_idx+1;
+					//chunk_index_buffer[index_idx++] = vert_idx+2;
+					//chunk_index_buffer[index_idx++] = vert_idx+0;
+					//chunk_index_buffer[index_idx++] = vert_idx+2;
+					
+					//chunk_index_buffer[index_idx++] = vert_idx+3;
+					//chunk_index_buffer[index_idx++] = vert_idx+0;
+				}
+			}
+		}
+	}
+	
+	chk->lod1_num_verts = vert_idx; // - chk->vertex_buffer_offset;
+	chk->lod1_num_indexes = index_idx; // TODO
+	
+}
+
+int base_vert_index_for_block[CHUNK_SIZE];
+
+void mesh_chunk(chunk* chk) {
+	int vert_idx = 0;
+	int index_idx = 0;
+	//return;
+
+	// output the first slab of vertexes
+	// then on each slab (aside from the first)
+	// output the first row of vertexes
+	// then on each row of voxels, output the first vertex.
+
+	// i dont know how this will work with face sorting
+	// hmm, i think it should work
+
+	// honestly, we should probably go with bigger chunks to reduce the overhead of draw calls
+
+	// 32x32x32?
+
+	// nest them 4 deep
+	// we need 2 bytes position per vertex, and then 3 bytes either rgb, normal, or material
+
+
+	gpu_vertex* vertex_buffer = chk->vertex_buffer;
+	if(vertex_buffer != NULL) { 
+		for(int y = 0; y < CHUNK_HEIGHT; y++) {
+			u8 is_edge_y = ((y == 0) || (y == CHUNK_HEIGHT-1)) ? 1 : 0;
+			for(int z = 0; z < CHUNK_DEPTH; z++) {
+				u8 is_edge_z = ((z == 0) || (z == CHUNK_DEPTH-1)) ? 1 : 0;
+				for(int x = 0; x < CHUNK_WIDTH; x++) {
+					int block_idx = y*CHUNK_DEPTH*CHUNK_WIDTH+z*CHUNK_WIDTH+x;
+					
+					base_vert_index_for_block[block_idx] = -1;
+					if((y == CHUNK_HEIGHT-1) || get_is_block_empty(chk,x,y+1,z)) {
+
+					} else {
+						continue; // simulate perfect occlusion culling
+					}
+
+					u8 is_edge_x = ((x == 0) || (x == CHUNK_WIDTH-1)) ? 1 : 0;
+
+					u8 block_type = get_block_type(chk, x,y,z);
+					u8 has_solid_block = block_type != AIR;
+					if(!has_solid_block) {  continue; }
+
+					u8 is_visible = (is_edge_x | is_edge_y | is_edge_z) ? 1 : 0;
+					if(!is_visible) {
+						// test neighboring bytes 
+						if(z > 0) {
+							is_visible |= get_is_block_empty(chk,x,y,z-1);
+						} 
+						if (z < CHUNK_DEPTH) {
+							is_visible |= get_is_block_empty(chk,x,y,z+1);
+						}
+
+						if(y > 0) {
+							is_visible |= get_is_block_empty(chk,x,y-1,z);
+						}
+						if (y < CHUNK_HEIGHT) {
+							is_visible |= get_is_block_empty(chk,x,y+1,z);
+						}
+
+						if(x > 0) {
+							is_visible |= get_is_block_empty(chk,x-1,y,z);
+						} 
+						if (z < CHUNK_WIDTH) {
+							is_visible |= get_is_block_empty(chk,x+1,y,z);
+						}
+					}
+
+					if(!is_visible) { continue; }
+
+					mat_uv block_uvs = material_uvs[block_type];
+
+					float lx = x;
+					float rx = x + 1.0f;
+
+					float dy = y;
+					float uy = y+1.0f;
+
+					float fz = z;
+
+					float bz = z+1.0f;
+					base_vert_index_for_block[block_idx] = vert_idx;
+
+					gpu_vertex *out_vert = &vertex_buffer[vert_idx];
+					out_vert->position[0] = lx;
+					out_vert->position[1] = dy;
+					out_vert->position[2] = fz;
+					out_vert->material[0] = block_type;
+					
+					out_vert = &vertex_buffer[vert_idx+1];
+					out_vert->position[0] = rx;
+					out_vert->position[1] = dy;
+					out_vert->position[2] = fz;
+					out_vert->material[0] = block_type;
+					
+					out_vert = &vertex_buffer[vert_idx+2];
+					out_vert->position[0] = lx;
+					out_vert->position[1] = uy;
+					out_vert->position[2] = fz;
+					out_vert->material[0] = block_type;
+					
+					out_vert = &vertex_buffer[vert_idx+3];
+					out_vert->position[0] = rx;
+					out_vert->position[1] = uy;
+					out_vert->position[2] = fz;
+					out_vert->material[0] = block_type;
+					
+					out_vert = &vertex_buffer[vert_idx+4];
+					out_vert->position[0] = lx;
+					out_vert->position[1] = dy;
+					out_vert->position[2] = bz;
+					out_vert->material[0] = block_type;
+					
+					out_vert = &vertex_buffer[vert_idx+5];
+					out_vert->position[0] = rx;
+					out_vert->position[1] = dy;
+					out_vert->position[2] = bz;
+					out_vert->material[0] = block_type;
+					
+					out_vert = &vertex_buffer[vert_idx+6];
+					out_vert->position[0] = lx;
+					out_vert->position[1] = uy;
+					out_vert->position[2] = bz;
+					out_vert->material[0] = block_type;
+					
+					out_vert = &vertex_buffer[vert_idx+7];
+					out_vert->position[0] = rx;
+					out_vert->position[1] = uy;
+					out_vert->position[2] = bz;
+					out_vert->material[0] = block_type;
+					
+					vert_idx += 8;
+				}
+			}
+		}
+
+		for(int face = 0; face < 6; face++) {
+			for(int y = 0; y < CHUNK_HEIGHT; y++) {
+				u8 is_edge_y = ((y == 0) || (y == CHUNK_HEIGHT-1)) ? 1 : 0;
+				for(int z = 0; z < CHUNK_DEPTH; z++) {
+					u8 is_edge_z = ((z == 0) || (z == CHUNK_DEPTH-1)) ? 1 : 0;
+					for(int x = 0; x < CHUNK_WIDTH; x++) {
+						
+						int block_idx = y*CHUNK_DEPTH*CHUNK_WIDTH+z*CHUNK_WIDTH+x;
+						
+						if(base_vert_index_for_block[block_idx] == -1) { 
+							continue;
+						}
+						//continue;
+						/*
+						
+							{0.0f, 0.0f, +1.0f},
+							{0.0f, 0.0f, -1.0f},
+							{+1.0f, 0.0f, 0.0f},
+							{-1.0f, 0.0f, 0.0f},
+							{0.0f, +1.0f, 0.0f},
+							{0.0f, -1.0f, 0.0f}
+						*/
+
+						int vert_idx = base_vert_index_for_block[block_idx];
+						if(face == 0) {
+							// back +z
+							if (z != 0) {
+								chunk_index_buffer[index_idx++] = vert_idx+6; // terminate previous fan 
+							}
+
+							chunk_index_buffer[index_idx++] = vert_idx+6;
+							chunk_index_buffer[index_idx++] = vert_idx+4;
+							chunk_index_buffer[index_idx++] = vert_idx+5;
+
+							chunk_index_buffer[index_idx++] = vert_idx+7;
+							//chunk_index_buffer[index_idx++] = vert_idx+6;
+							//chunk_index_buffer[index_idx++] = vert_idx+5;
+							if(z != CHUNK_DEPTH-1) {
+								chunk_index_buffer[index_idx++] = vert_idx+7;
+								//chunk_index_buffer[index_idx++] = vert_idx+7;
+							}
+							//chunk_index_buffer[index_idx++] = 0xFFFF;
+							//chunk_index_buffer[index_idx++] = vert_idx+6;
+							//chunk_index_buffer[index_idx++] = vert_idx+5;
+						} else if(face == 1) {
+							// front -z
+							//chunk_index_buffer[index_idx++] = vert_idx+2;
+							//chunk_index_buffer[index_idx++] = vert_idx+1;
+							//chunk_index_buffer[index_idx++] = vert_idx+0;
+
+							//chunk_index_buffer[index_idx++] = vert_idx+1; // 2
+							//chunk_index_buffer[index_idx++] = 0xFFFF;
+							//chunk_index_buffer[index_idx++] = vert_idx+2; // 0
+							//chunk_index_buffer[index_idx++] = vert_idx+3; // 3
+						} else if (face == 2) {
+							// right +x
+							//chunk_index_buffer[index_idx++] = vert_idx+1;
+							//chunk_index_buffer[index_idx++] = vert_idx+3;
+							//chunk_index_buffer[index_idx++] = vert_idx+7;
+
+							//chunk_index_buffer[index_idx++] = vert_idx+1;
+							//chunk_index_buffer[index_idx++] = 0xFFFF;
+							//chunk_index_buffer[index_idx++] = vert_idx+7;
+							//chunk_index_buffer[index_idx++] = vert_idx+5;
+						} else if (face == 3) {
+
+							// left -x
+							//chunk_index_buffer[index_idx++] = vert_idx+4;
+							//chunk_index_buffer[index_idx++] = vert_idx+6;
+							//chunk_index_buffer[index_idx++] = vert_idx+2;
+
+							//chunk_index_buffer[index_idx++] = vert_idx+4;
+							//chunk_index_buffer[index_idx++] = 0xFFFF;
+							//chunk_index_buffer[index_idx++] = vert_idx+2;
+							//chunk_index_buffer[index_idx++] = vert_idx+0;
+
+						} else if (face == 4) {
+
+							// up +y
+							//chunk_index_buffer[index_idx++] = vert_idx+6;
+							//chunk_index_buffer[index_idx++] = vert_idx+7;
+							//chunk_index_buffer[index_idx++] = vert_idx+3;
+
+							//chunk_index_buffer[index_idx++] = vert_idx+6;
+							//chunk_index_buffer[index_idx++] = 0xFFFF;
+							//chunk_index_buffer[index_idx++] = vert_idx+3;
+							//chunk_index_buffer[index_idx++] = vert_idx+2;
+						} else if (face == 5) {
+							// down -y
+							//chunk_index_buffer[index_idx++] = vert_idx+0;
+							//chunk_index_buffer[index_idx++] = vert_idx+5;
+							//chunk_index_buffer[index_idx++] = vert_idx+1;
+
+							//chunk_index_buffer[index_idx++] = vert_idx+0;
+							//chunk_index_buffer[index_idx++] = vert_idx+4;
+							//chunk_index_buffer[index_idx++] = vert_idx+5;
+						}
+						//}
+					}
+				}
+			}
+		}
+
+		
+		chk->num_verts = vert_idx; // - chk->vertex_buffer_offset;
+		chk->num_indexes = index_idx; // TODO
+	}
+	
+	//mesh_chunk_lod1(chk);
+}
+
+static DVLB_s *vshader_dvlb, *skybox_vshader_dvlb;
+static shaderProgram_s program, skybox_program;
+static int uLoc_projection, uLoc_modelView, uLoc_mvp;
+static int uLoc_lightVec, uLoc_lightHalfVec, uLoc_lightClr, uLoc_material;
+static int skybox_uLoc_projection, skybox_uLoc_modelView;
+static int uLoc_chunkOffset, uLoc_normal, uLoc_rawVertexColor;
+
+static C3D_Mtx projection;
+//static C3D_Material material =
+//{
+//	{ 0.3f, 0.3f, 0.3f }, // Ambient
+//	{ 0.4f, 0.4f, 0.4f }, // Diffuse
+//	{ 0.2f, 0.2f, 0.2f }, // Specular
+//	{ 0.0f, 0.0f, 0.0f }, //specular1
+//	{ 0.0f, 0.0f, 0.0f }, // Emission
+//};
+static C3D_Mtx material =
+{
+	{
+	{ { 0.3f, 0.3f, 0.3f, 0.3f } }, // Ambient
+	{ { 0.0f, 0.4f, 0.4f, 0.4f } }, // Diffuse
+	{ { 0.1f, 0.1f, 0.1f, 0.1f } }, // Specular
+	{ { 1.0f, 0.0f, 0.0f, 0.0f } }, // Emission
+	}
+};
+
+static void *lod0_vbo_data;
+static C3D_Tex atlas_tex, normal_atlas_tex;
+static C3D_Tex skybox_tex;
+static C3D_TexCube skybox_cube;
+static float angleX = -32.0, angleY = 209.0;
+
+
+static bool loadTextureAtlasFromMem(C3D_Tex* tex, const void* data, size_t size, mat_uv* uvs) {
+	Tex3DS_Texture t3x = Tex3DS_TextureImport(data, size, tex, NULL, true);
+	if (!t3x) {
+		return false;
+	}
+	
+	//Tex3DS_TextureImport(data
+	//if(uvs != NULL) {
+	//	int num_sub_texs = Tex3DS_GetNumSubTextures(t3x);
+	//	for(int i = 0; i < num_sub_texs; i++) {
+	//		Tex3DS_SubTexture* subTex = Tex3DS_GetSubTexture(t3x, i);
+	//		uvs[i].u1 = subTex->left;
+	//		uvs[i].u2 = subTex->right;
+	//		uvs[i].v1 = subTex->bottom;
+	//		uvs[i].v2 = subTex->top;
+	//		//printf("%f %f\n", subTex->bottom, subTex->left);
+	//		//printf("%f %f\n", subTex->top, subTex->right);
+	//		//t3x
+	//	}
+	//}
+	// Delete the t3x object since we don't need it
+	Tex3DS_TextureFree(t3x);
+	return true;
+}
+
+
+static bool loadTextureFromMem(C3D_Tex* tex, C3D_TexCube* cube, const void* data, size_t size) {
+	Tex3DS_Texture t3x = Tex3DS_TextureImport(data, size, tex, cube, true);
+	if (!t3x) {
+		return false;
+	}
+	//printf("mip min level %i, max level %i\n", tex->minLevel, tex->maxLevel);
+	// Delete the t3x object since we don't need it
+	Tex3DS_TextureFree(t3x);
+	return true;
+}
+
+
+
+static C3D_LightEnv lightEnv;
+
+static C3D_Light light;
+static C3D_LightLut lut_phong;
+
+C3D_LightLutDA point_light_lut;
+
+static C3D_FogLut lut_fog;
+
+
+float lutSquaredDist(float input, float offset, float scale) {
+    return((input*input) * scale + offset);
+}
+
+
+static void sceneInit() {
+
+	chunk_index_buffer = linearAlloc(sizeof(uint16_t)*CHUNK_SIZE*36); 
+	vram_index_buffer = vramAlloc(sizeof(uint16_t)*CHUNK_SIZE*36);
+	int vertex_offset = 36;
+	for(int cz = 0; cz < NUM_CHUNKS_X; cz++) {
+		for(int cx = 0; cx < NUM_CHUNKS_Z; cx++) {
+			
+			init_chunk(&in_memory_chunks[cz*NUM_CHUNKS_X+cx], (C3D_FVec){.x = -CHUNK_WIDTH+cx*CHUNK_WIDTH, .y = 0.0f, .z = -CHUNK_DEPTH+cz*CHUNK_DEPTH});
+			//in_memory_chunks[cz*NUM_CHUNKS_X+cx].vertex_buffer_offset = vertex_offset;
+			//vertex_offset += MAX_VERTS;
+			mesh_chunk(&in_memory_chunks[cz*NUM_CHUNKS+cx]);
+
+		}
+	}
+	//if(needs_update) {
+		mmCopy(vram_index_buffer, chunk_index_buffer, sizeof(uint16_t*)*CHUNK_SIZE*36);
+	//}
+
+	//in_memory_chunks[24].vertex_buffer = lod0_chunk_pointers[0];
+	//in_memory_chunks[25].vertex_buffer = lod0_chunk_pointers[1];
+	//in_memory_chunks[31].vertex_buffer = lod0_chunk_pointers[2];
+	//in_memory_chunks[32].vertex_buffer = lod0_chunk_pointers[3];
+	//in_memory_chunks[0].vertex_buffer = NULL;
+	//in_memory_chunks[1].vertex_buffer = NULL;
+	//in_memory_chunks[2].vertex_buffer = NULL;
+	//in_memory_chunks[3].vertex_buffer = NULL;
+	
+	//chunk_index_buffer = vramAlloc(sizeof(uint16_t)*MAX_VERTS);
+	int index_idx = 0; int vert_idx = 0;
+
+
+	/*
+	for(int z = CHUNK_DEPTH; z < CHUNK_DEPTH; z++) {
+		for(int y = 0; y < CHUNK_HEIGHT; y++) {
+			for(int x = 0; x < CHUNK_WIDTH; x++) {
+				chunk_index_buffer[index_idx++] = vert_idx+2;
+				chunk_index_buffer[index_idx++] = vert_idx+1;
+				chunk_index_buffer[index_idx++] = vert_idx+0;
+
+				chunk_index_buffer[index_idx++] = vert_idx+1; // 2
+				chunk_index_buffer[index_idx++] = vert_idx+2; // 0
+				chunk_index_buffer[index_idx++] = vert_idx+3; // 3
+
+
+				// back
+				chunk_index_buffer[index_idx++] = vert_idx+4;
+				chunk_index_buffer[index_idx++] = vert_idx+5;
+				chunk_index_buffer[index_idx++] = vert_idx+6;
+
+				chunk_index_buffer[index_idx++] = vert_idx+7;
+				chunk_index_buffer[index_idx++] = vert_idx+6;
+				chunk_index_buffer[index_idx++] = vert_idx+5;
+
+				// left
+				chunk_index_buffer[index_idx++] = vert_idx+4;
+				chunk_index_buffer[index_idx++] = vert_idx+6;
+				chunk_index_buffer[index_idx++] = vert_idx+2;
+
+				chunk_index_buffer[index_idx++] = vert_idx+4;
+				chunk_index_buffer[index_idx++] = vert_idx+2;
+				chunk_index_buffer[index_idx++] = vert_idx+0;
+
+				// right
+				chunk_index_buffer[index_idx++] = vert_idx+1;
+				chunk_index_buffer[index_idx++] = vert_idx+3;
+				chunk_index_buffer[index_idx++] = vert_idx+7;
+
+				chunk_index_buffer[index_idx++] = vert_idx+1;
+				chunk_index_buffer[index_idx++] = vert_idx+7;
+				chunk_index_buffer[index_idx++] = vert_idx+5;
+
+				// up
+				chunk_index_buffer[index_idx++] = vert_idx+6;
+				chunk_index_buffer[index_idx++] = vert_idx+7;
+				chunk_index_buffer[index_idx++] = vert_idx+3;
+
+				chunk_index_buffer[index_idx++] = vert_idx+6;
+				chunk_index_buffer[index_idx++] = vert_idx+3;
+				chunk_index_buffer[index_idx++] = vert_idx+2;
+
+				// down
+				chunk_index_buffer[index_idx++] = vert_idx+0;
+				chunk_index_buffer[index_idx++] = vert_idx+5;
+				chunk_index_buffer[index_idx++] = vert_idx+1;
+
+				chunk_index_buffer[index_idx++] = vert_idx+0;
+				chunk_index_buffer[index_idx++] = vert_idx+4;
+				chunk_index_buffer[index_idx++] = vert_idx+5;
+				
+				vert_idx += 8;
+			}
+		}
+	}
+	*/
+	
+	
+
+	// Load the vertex shader, create a shader program and bind it
+	vshader_dvlb = DVLB_ParseFile((u32*)vshader_shbin, vshader_shbin_size);
+	shaderProgramInit(&program);
+	shaderProgramSetVsh(&program, &vshader_dvlb->DVLE[0]);
+
+	
+	skybox_vshader_dvlb = DVLB_ParseFile((u32*)skybox_shbin, skybox_shbin_size);
+	shaderProgramInit(&skybox_program);
+	shaderProgramSetVsh(&skybox_program, &skybox_vshader_dvlb->DVLE[0]);
+
+	
+	uLoc_projection = shaderInstanceGetUniformLocation(program.vertexShader, "projection");
+	uLoc_modelView  = shaderInstanceGetUniformLocation(program.vertexShader, "modelView");
+	uLoc_mvp  = shaderInstanceGetUniformLocation(program.vertexShader, "mvp");
+	uLoc_lightVec     = shaderInstanceGetUniformLocation(program.vertexShader, "lightVec");
+	uLoc_lightHalfVec = shaderInstanceGetUniformLocation(program.vertexShader, "lightHalfVec");
+	uLoc_lightClr     = shaderInstanceGetUniformLocation(program.vertexShader, "lightClr");
+	uLoc_material     = shaderInstanceGetUniformLocation(program.vertexShader, "material");
+	uLoc_chunkOffset  = shaderInstanceGetUniformLocation(program.vertexShader, "chunk_offset");
+	uLoc_normal  = shaderInstanceGetUniformLocation(program.vertexShader, "innrm");
+	uLoc_rawVertexColor = shaderInstanceGetUniformLocation(program.vertexShader, "useRawVertexColor");
+
+	skybox_uLoc_projection = shaderInstanceGetUniformLocation(skybox_program.vertexShader, "projection");
+	skybox_uLoc_modelView  = shaderInstanceGetUniformLocation(skybox_program.vertexShader, "modelView");
+
+	// Compute the projection matrix
+	
+	// Create the VBO (vertex buffer object)
+	lod0_vbo_data = linearAlloc(CUBE_VERTS*sizeof(gpu_vertex)); // an extra 36 vertexes for skybox (could be 24, whatever)
+	for(int i = 0; i < 36; i++) {
+		gpu_vertex *vert_out = &((gpu_vertex*)lod0_vbo_data)[i];
+		vert_out->position[0] = cube_vert_list[i].position[0];
+		vert_out->position[1] = cube_vert_list[i].position[1];
+		vert_out->position[2] = cube_vert_list[i].position[2];
+	}
+
+
+	// Configure buffers
+
+	// Load the texture and bind it to the first texture unit
+	if (!loadTextureAtlasFromMem(&atlas_tex, atlas_t3x, atlas_t3x_size, material_uvs)) {//loadTextureAtlasFromMem(&atlas_tex, atlas_t3x, atlas_t3x_size, material_uvs)) {
+		svcBreak(USERBREAK_PANIC);
+	}
+	if (!loadTextureAtlasFromMem(&normal_atlas_tex, normal_atlas_t3x, normal_atlas_t3x_size, NULL)) {
+		svcBreak(USERBREAK_PANIC);
+	}
+
+	
+	if (!loadTextureFromMem(&skybox_tex, &skybox_cube, skybox_t3x, skybox_t3x_size)) {
+		svcBreak(USERBREAK_PANIC);
+	}
+
+	C3D_TexSetWrap(&atlas_tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+	C3D_TexSetWrap(&normal_atlas_tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+	C3D_TexSetWrap(&skybox_tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+
+	C3D_TexSetFilter(&atlas_tex, GPU_NEAREST, GPU_NEAREST);
+	C3D_TexSetFilter(&normal_atlas_tex, GPU_NEAREST, GPU_NEAREST);
+	C3D_TexSetFilter(&skybox_tex, GPU_LINEAR, GPU_LINEAR);
+	C3D_TexSetFilterMipmap(&atlas_tex, GPU_LINEAR);
+	
+	// setup gpu state for voxel world
+	C3D_TexBind(0, &skybox_tex);
+	C3D_TexBind(1, &atlas_tex);
+	C3D_TexBind(2, &normal_atlas_tex);
+	FogLut_Exp(&lut_fog, 0.005f, 1.0f, 0.4f, 8000.0f);
+	//FogLut_Exp(&lut_fog, 0.02f, .05f, 0.1f, 100.0f);
+	C3D_FogGasMode(GPU_FOG,  GPU_PLAIN_DENSITY, false);
+	C3D_FogColor(0xA7D178);
+	C3D_FogLutBind(&lut_fog);
+
+	LightLut_Phong(&lut_phong, 5);
+	C3D_LightEnvLut(&lightEnv, GPU_LUT_D0, GPU_LUTINPUT_LN, false, &lut_phong);
+
+	// Configure the first fragment shading substage to blend the texture color with
+	// the vertex color (calculated by the vertex shader using a lighting algorithm)
+	// See https://www.opengl.org/sdk/docs/man2/xhtml/glTexEnv.xml for more insight
+
+
+	C3D_LightEnvInit(&lightEnv);
+	C3D_LightInit(&light, &lightEnv);
+
+	//C3D_LightColor(&light, 1.0, 1.0, 1.0);
+	//C3D_LightPosition(&light, &lightVec);
+
+	//LightLutDA_Create(&point_light_lut, lutSquaredDist, 0.0, 16.0, 0.0, 6.0);
+	//C3D_LightDistAttnEnable(&light, true);
+	//C3D_LightDistAttn(&light, &point_light_lut);    
+}
+
+float camX = 0.0f;
+float camY = 20.0f;
+float camZ = 0.0f;
+
+float lerp(float a, float b, float f) 
+{
+    return (a * (1.0 - f)) + (b * f);
+}
+
+	
+
+static void sceneRender(u64 frame, float iod, C3D_FVec cam_dir, C3D_FVec cam_pos) {
+
+	//GPUREG_RESTART_PRIMITIVE
+	
+	C3D_BindProgram(&skybox_program);
+
+	C3D_AttrInfo* attrInfo = C3D_GetAttrInfo();
+	AttrInfo_Init(attrInfo);
+	AttrInfo_AddLoader(attrInfo, 0, GPU_BYTE, 3); // v0=position
+	AttrInfo_AddLoader(attrInfo, 1, GPU_BYTE, 1); // v1=material
+
+	bufInfo = C3D_GetBufInfo();
+	BufInfo_Init(bufInfo);
+	BufInfo_Add(bufInfo, lod0_vbo_data, sizeof(gpu_vertex), 2, 0x10);
+
+	//C3D_TexBind(0, &skybox_tex);
+	C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+	//C3D_EarlyDepthTest(false, GPU_GREATER, 1);
+
+	C3D_LightColor(&light, 0.0f, 0.0f, 0.0f);
+	C3D_TexEnv* env = C3D_GetTexEnv(0);
+	C3D_TexEnvInit(env);
+	C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, 0, 0);
+	C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+	C3D_TexEnvInit(C3D_GetTexEnv(2));
+
+	C3D_Mtx modelView;
+	Mtx_Identity(&modelView);
+	Mtx_RotateX(&modelView, -C3D_AngleFromDegrees(angleX), true);
+	Mtx_RotateY(&modelView, -C3D_AngleFromDegrees(angleY), true);
+
+	Mtx_PerspStereoTilt(&projection, C3D_AngleFromDegrees(40.0f), C3D_AspectRatioTop, 0.4f, 8000.0f, iod, 3.0f, false);
+
+
+
+	// Update the uniforms
+	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, skybox_uLoc_projection, &projection);
+	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, skybox_uLoc_modelView,  &modelView);
+
+	// Draw the VBO
+	C3D_CullFace(GPU_CULL_FRONT_CCW);
+
+    C3D_DrawArrays(GPU_TRIANGLES, 0, 36);
+
+
+
+	C3D_BindProgram(&program);
+	C3D_DepthTest(true, GPU_GREATER, GPU_WRITE_ALL);
+	//C3D_EarlyDepthTest(true, GPU_GREATER, 1);
+
+
+
+
+
+
+	float sun_angle = lerp(0.0f, 2*M_PI, (frame%1000)/1000.0f);
+	float sun_x = cosf(sun_angle)*10.0f;
+	float sun_y = 0.0f;
+	float sun_z = sinf(sun_angle)*10.0f;
+
+	C3D_FVec lightVec = FVec4_New(sun_x, sun_y, sun_z, 1.0f);
+	// printf("sun %f,%f,%f\n", sun_x, sun_y, sun_z);
+	//C3D_LightEnvBind(&lightEnv);
+	// draw voxels on top
+
+	//C3D_LightColor(&light, 0.3, 0.3, 0.3);
+	//C3D_LightEnvMaterial(&lightEnv, &material);
+	//C3D_LightEnvBumpMode(&lightEnv, GPU_BUMP_NOT_USED);
+	//C3D_LightEnvBumpSel(&lightEnv, 1);
+	//C3D_LightPosition(&light, &lightVec);
+	//C3D_LightEnvBind(&lightEnv);
+
+	//printf("num verts %i\n", num_verts);
+	//int cur_vert_idx = CUBE_VERTS;
+	//int cur_index_idx = 0;
+	int needs_update = 0;
+	for(int i = 0; i < NUM_CHUNKS; i++) {
+		if(in_memory_chunks[i].has_been_modified) {
+			//chunk(&in_memory_chunks[i]); //, lod0_vbo_data);
+			in_memory_chunks[i].has_been_modified = 0;
+			needs_update = 1;
+
+		}
+	}
+
+
+	//GSPGPU_FlushDataCache(chunk_index_buffer, sizeof(uint16_t)*CHUNK_SIZE*36);
+	//GX_RequestDma((u32*)chunk_index_buffer, vram_index_buffer, sizeof(uint16_t)*CHUNK_SIZE*36);
+	//gspWaitForDMA();
+
+
+	C3D_CullFace(GPU_CULL_BACK_CCW);
+	// Calculate the modelView matrix
+	Mtx_Identity(&modelView);
+	Mtx_RotateX(&modelView, -C3D_AngleFromDegrees(angleX), true);
+	Mtx_RotateY(&modelView, -C3D_AngleFromDegrees(angleY), true);
+	
+	Mtx_Translate(&modelView, -camX, -camY, -camZ, true); 
+
+	C3D_Mtx mvp;
+	Mtx_Multiply(&mvp, &projection, &modelView);
+
+	// Update the uniforms
+	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLoc_projection, &projection);
+	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLoc_modelView,  &modelView);
+	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLoc_material,   &material);
+	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLoc_mvp,  &mvp);
+
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, uLoc_lightVec,    sun_x, sun_y, sun_z, 1.0f); // 0.0f, 0.0f, -1.0f, 0.0f);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, uLoc_lightHalfVec, 0.0f, 0.0f, -1.0f, 0.0f);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, uLoc_lightClr,     1.0f, 1.0f,  1.0f, 1.0f);
+
+
+
+	// Draw the VBO
+	// third parameter is number of vertexes, and how they're arranged
+	
+	//C3D_DrawArrays(GPU_TRIANGLES, 36, num_verts);
+
+	int verts_drawn = 0;
+	int possible_verts_drawn = 0;
+	for(int i = 0; i < NUM_CHUNKS; i++) {
+
+		chunk* chk = &in_memory_chunks[i];
+		gpu_vertex* cur_vert_buffer;
+		int num_indexes; 
+
+		if(chk->vertex_buffer == NULL) {
+			//continue;
+			continue; // SKIP lod 1
+			C3D_AttrInfo* attrInfo = C3D_GetAttrInfo();
+			AttrInfo_Init(attrInfo);
+			AttrInfo_AddLoader(attrInfo, 0, GPU_BYTE, 4); // v0=position
+			AttrInfo_AddLoader(attrInfo, 1, GPU_BYTE, 4); // v1=texcoord
+			//AttrInfo_AddLoader(attrInfo, 1, GPU_SHORT, 2); // v1=vertex colors
+
+			C3D_FVUnifSet(VERTEX_SHDR, uLoc_rawVertexColor, 1.0f,0.0f,0.0f,0.0f);
+
+			env = C3D_GetTexEnv(0);
+			C3D_TexEnvInit(env);
+			C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, 0, 0); //GPU_PRIMARY_COLOR, 0);
+			C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+			cur_vert_buffer = (gpu_vertex*)(chk->lod1_vertex_buffer);
+			num_indexes = chk->lod1_num_indexes;
+		} else {		
+			
+			C3D_AttrInfo* attrInfo = C3D_GetAttrInfo();
+			AttrInfo_Init(attrInfo);
+			AttrInfo_AddLoader(attrInfo, 0, GPU_BYTE, 3); // v0=position
+			AttrInfo_AddLoader(attrInfo, 1, GPU_BYTE, 1); // v1=material
+
+			C3D_FVUnifSet(VERTEX_SHDR, uLoc_rawVertexColor, 0.0f,0.0f,0.0f,0.0f);
+
+			env = C3D_GetTexEnv(0);
+			C3D_TexEnvInit(env);
+			C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE1, 0, 0); //GPU_PRIMARY_COLOR, 0);
+			C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+			cur_vert_buffer = chk->vertex_buffer;
+			num_indexes = chk->num_indexes;
+		}
+
+		bufInfo = C3D_GetBufInfo();
+		BufInfo_Init(bufInfo);
+		BufInfo_Add(bufInfo, cur_vert_buffer, sizeof(gpu_vertex), 2, 0x10);
+
+		C3D_FVUnifSet(GPU_VERTEX_SHADER, uLoc_chunkOffset, chk->base_pos.x, chk->base_pos.y, chk->base_pos.z, 1.0f);
+
+		int num_indexes_per_face = num_indexes/6;
+
+		//C3D_DrawElements(GPU_TRIANGLES, num_indexes, C3D_UNSIGNED_SHORT, chunk_index_buffer);//*face);
+		//verts_drawn += num_indexes;
+		//possible_verts_drawn +=  
+		//continue;
+		
+		for(int face = 0; face < 1; face++) {
+			possible_verts_drawn += num_indexes_per_face;
+			
+			C3D_FVec base_vec = FVec3_New(chk->base_pos.x, chk->base_pos.y, chk->base_pos.z);
+			C3D_FVec max_vec = FVec3_New(chk->max_pos.x, chk->max_pos.y, chk->max_pos.z);
+			C3D_FVec mid_vec = FVec3_Scale(FVec3_Add(base_vec, max_vec), 0.5f);
+			C3D_FVec cam_pos_vec = FVec3_New(cam_pos.x, cam_pos.y, cam_pos.z);
+			
+
+	        C3D_FVec to_center = FVec3_Subtract(FVec3_Scale(FVec3_Add(base_vec, max_vec), 1.0/2.0f), cam_pos_vec);
+
+			float d = FVec3_Dot(to_center, 
+								FVec3_New(face_normals[face].x, face_normals[face].y, face_normals[face].z));
+			if(d > 0) { continue; }
+			C3D_FVUnifSet(GPU_VERTEX_SHADER, uLoc_normal, face_normals[face].x, face_normals[face].y, face_normals[face].z, 0.0f);
+
+			C3D_DrawElements(GPU_TRIANGLE_FAN, num_indexes_per_face, C3D_UNSIGNED_SHORT, ((u16*)vram_index_buffer)+num_indexes_per_face*face);
+
+			verts_drawn += num_indexes_per_face;
+		}
+		
+
+		//C3D_DrawArrays(GPU_TRIANGLES, 0, in_memory_chunks[i].num_verts);
+		//printf("drew %i verts\n", in_memory_chunks[i].num_verts);
+
+
+
+	}
+	//printf("Drew %i triangles\n", verts_drawn/3);
+
+}
+
+static void sceneExit(void)
+{
+	// Free the texture
+	C3D_TexDelete(&atlas_tex);
+	C3D_TexDelete(&normal_atlas_tex);
+
+	// Free the VBO
+	linearFree(lod0_vbo_data);
+	for(int i = 0; i < NUM_CHUNKS; i++) {
+		linearFree(in_memory_chunks[i].vertex_buffer);
+	}
+
+	// Free the shader program
+	shaderProgramFree(&program);
+	shaderProgramFree(&skybox_program);
+	DVLB_Free(vshader_dvlb);
+	DVLB_Free(skybox_vshader_dvlb);
+}
+
+int main()
+{
+	// Initialize graphics
+	gfxInitDefault();
+	
+	vramFree(vramAlloc(0));
+	VRAM_TOTAL = vramSpaceFree();
+
+
+	gfxSet3D(true); // Enable stereoscopic 3D
+	consoleInit(GFX_BOTTOM, NULL);
+	C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
+
+	//C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
+	//C2D_Prepare();
+
+	// Initialize the render target
+	//C3D_RenderTarget* target = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
+	//C3D_RenderTargetSetOutput(target, GFX_TOP, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
+
+	C3D_RenderTarget* targetLeft  = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
+	C3D_RenderTarget* targetRight = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
+	C3D_RenderTargetSetOutput(targetLeft,  GFX_TOP, GFX_LEFT,  DISPLAY_TRANSFER_FLAGS);
+	C3D_RenderTargetSetOutput(targetRight, GFX_TOP, GFX_RIGHT, DISPLAY_TRANSFER_FLAGS);
+	
+
+	init_chunk_pointers();
+
+	// Initialize the scene
+	sceneInit();
+
+	
+
+
+	u64 frame = 0;
+	// Main loop
+	while (aptMainLoop())
+	{
+		
+		//u64 tickStart = svcGetSystemTick();
+		u64 msStart = osGetTime();
+		hidScanInput();
+
+		// Respond to user input
+		u32 kDown = hidKeysDown();
+		u32 kHeld = hidKeysHeld();
+		if (kDown & KEY_START) {
+			break; // break in order to return to hbmenu
+		}
+		if (kHeld & KEY_CSTICK_LEFT) {
+			angleY += 1.0;
+		} else if(kHeld & KEY_CSTICK_RIGHT) {
+			angleY -= 1.0;
+		}
+		
+		if (kHeld & KEY_CSTICK_UP) {
+			angleX += 1.0;
+		} else if(kHeld & KEY_CSTICK_DOWN) {
+			angleX -= 1.0;
+		}
+
+		// Compute forward vector from angles
+		float cosPitch = cosf(C3D_AngleFromDegrees(angleX));
+		float sinPitch = sinf(C3D_AngleFromDegrees(angleX));
+		float cosYaw   = cosf(C3D_AngleFromDegrees(angleY));
+		float sinYaw   = sinf(C3D_AngleFromDegrees(angleY));
+
+		float forwardX = -cosPitch * sinYaw;
+		float forwardY = sinPitch;
+		float forwardZ = -cosPitch * cosYaw;
+		float speed = 0.1f;
+
+		circlePosition cpos;
+		hidCircleRead(&cpos);
+
+		float lerpSpeed = 0.0f;
+		if (cpos.dy < 0) {
+			float dy = cpos.dy / -154.0f;
+			dy = dy > 1.0f ? 1.0f : dy;
+			lerpSpeed = -lerp(0, speed, dy);
+		} else if (cpos.dy > 0) {
+			float dy = cpos.dy / 154.0f;
+			dy = dy > 1.0f ? 1.0f : dy;
+			lerpSpeed = lerp(0, speed, dy);
+		}
+
+		camX += forwardX * lerpSpeed;
+		camY += forwardY * lerpSpeed;
+		camZ += forwardZ * lerpSpeed;
+
+		if (cpos.dx < 0) {
+			float dx = cpos.dx / -154.0f;
+			dx = dx > 1.0f ? 1.0f : dx;
+			angleY += lerp(0, 1.0f, dx);
+		} else if(cpos.dx > 0) {
+			float dx = cpos.dx / 154.0f;
+			dx = dx > 1.0f ? 1.0f : dx;
+			angleY -= lerp(0, 1.0f, dx);
+		}
+
+
+		C3D_FVec cam_pos = {.x = camX, .y = camY, .z = camZ};
+		C3D_FVec cam_dir = {.x = forwardX, .y = forwardY, .z = forwardZ};
+		cam_dir = FVec3_Normalize(cam_dir);
+		
+
+		if((kDown & KEY_A) || (kDown & KEY_R)) {
+			int idx = -1; //raycast_to_first_solid_chunk(&test_chunk, cam_pos, cam_dir);
+			if(idx != -1) {
+				//delete_voxel_at_block_idx(&test_chunk, idx);
+				//test_chunk.has_been_modified = 1;
+			}
+		}
+
+
+
+		float slider = osGet3DSliderState();
+		float iod = slider/4;
+
+		// Render the scene
+		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+			C3D_RenderTargetClear(targetLeft, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
+			C3D_FrameDrawOn(targetLeft);
+			
+			sceneRender(frame, -iod, cam_dir, cam_pos);
+
+			if (iod > 0.0f)
+			{
+				C3D_RenderTargetClear(targetRight, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
+				C3D_FrameDrawOn(targetRight);
+				//sceneRender(frame,  iod, cam_dir, cam_pos);
+			}
+			//sceneRender(-1, cam_dir, cam_pos);
+		C3D_FrameEnd(0);
+		frame++;
+		
+		u64 msEnd = osGetTime();	
+		s64 elapsed_ms = msEnd - msStart;
+		//printf("%i fps\n", (int)(1000.0f/elapsed_ms));
+		//printf("%lli ms\n", elapsed_ms);
+	}
+	
+	
+
+	// Deinitialize the scene
+	sceneExit();
+
+	// Deinitialize graphics
+	C3D_Fini();
+	gfxExit();
+	return 0;
+}
