@@ -1,0 +1,2 @@
+-f rgb888 -z none
+render_target_tex.png
