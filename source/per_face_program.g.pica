@@ -2,7 +2,7 @@
 .gsh point c0
 
 ; Uniforms
-.bool draw_top_uvs
+.bool is_lod_chunk, draw_top_uvs
 
 ; Constants
 .constf myconst(0.0, 1.0, 0.25, -4.0)
@@ -39,6 +39,8 @@
 
 .entry gmain
 .proc gmain
+
+    jmpu is_lod_chunk, lod_geoshader
 
     ; calculate UVs for the four vertexes
     ; can't use just 0->1, because we use a texture atlas of 8 subtextures in a row
@@ -99,6 +101,31 @@ skip_top_uvs:
     mov outtc1, r4.yw
     emit
 
+
+    end
+
+lod_geoshader:
+    mov r0, col_scale
+    mul r0, v1, r0
+    mov r0.w, ones.w
+
+    setemit 0
+    mov outpos, v4
+    mov outclr, r0
+    emit 
+    
+    setemit 1
+    mov outpos, v2 
+    mov outclr, r0
+    emit 
+    setemit 2, prim
+    mov outpos, v0
+    mov outclr, r0
+    emit 
+    setemit 2, prim inv 
+    mov outpos, v6
+    mov outclr, r0
+    emit
 
     end
 

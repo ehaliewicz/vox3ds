@@ -4,7 +4,6 @@
 .fvec mvp[4]
 .fvec chunk_offset;
 
-
 ; Outputs
 .out outpos position
 .out outclr color

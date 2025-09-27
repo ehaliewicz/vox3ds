@@ -42,7 +42,7 @@
 .entry gmain
 .proc gmain
 
-    jmpu b0, lod_geoshader
+    jmpu isLODChunk, lod_geoshader
 
     ; calculate UVs for the four vertexes
     ; can't use just 0->1, because we use a texture atlas of 8 subtextures in a row
