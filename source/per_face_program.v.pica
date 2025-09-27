@@ -1,0 +1,36 @@
+; Example PICA200 vertex shader
+
+; Uniforms
+.fvec mvp[4]
+.fvec chunk_offset;
+
+.constf myconst(0.0, 1.0, 0.25, -4.0)
+.constf myconst2(0.0, 0.5, 0.0, 0.00392)
+.alias zeros myconst.xxxx ; Vector full of zeros
+.alias ones  myconst.yyyy ; Vector full of ones
+
+; Outputs
+.out outpos position
+.out outclr color
+
+; Inputs (defined as aliases for convenience)
+.alias inpos v0
+.alias inmat v1
+
+.proc main
+	mov r1, ones
+	; Force the w component of inpos to be 1.0
+	add r0, chunk_offset, inpos
+
+
+	; without lighting we can merge these dot products
+
+	dp4 outpos.x, mvp[0], r0
+	dp4 outpos.y, mvp[1], r0
+	dp4 outpos.z, mvp[2], r0
+	dp4 outpos.w, mvp[3], r0
+
+	mov outclr, inmat  ; put material index in outclr
+	end
+
+.end

@@ -1,0 +1,392 @@
+; Example PICA200 geometry shader
+.gsh point c0
+
+; Uniforms
+.bool isLODChunk, skip_x_plus_face, skip_x_minus_face, skip_z_plus_face, skip_z_minus_face
+
+; Constants
+.constf myconst(0.0, 1.0, 0.25, -4.0)
+.constf myconst2(0.0, 0.5, 0.0, 0.00392)
+.alias zeros myconst.xxxx ; Vector full of zeros
+.alias ones  myconst.yyyy ; Vector full of ones
+.alias one_fourths myconst.zzzz
+.alias neg_fours myconst.wwww
+.alias one_halfs myconst2.yyyy
+.alias zero_one_zero_one myconst.xyxy
+.alias col_scale myconst2.wwww
+.alias one_halfs_on_y myconst2.xxyy
+
+; Outputs - this time the type *is* used
+.out outpos position
+.out outtc1 texcoord1
+.out outclr color
+
+; 8 texture coordinates
+; so we need 8 registers
+
+
+; Inputs: we will receive the following inputs:
+; v0-v1: position/material of v0
+; v2-v3: position/material of v1
+; v4-v5: position/material of v2
+; v6-v7: position/material of v3
+; v8-v9: v4
+; v10-v11: v5
+; v12-v13: v6
+; v14-v15: v7
+
+; this geometry shader takes 4 vertexes and outputs two triangles (6 vertexes)
+; although we receive a material index from all four vertexes, we will specifically be using the material from the fourtsh vertex
+; all vertexes are shared, except for the fourth, which will have the correct material index (shenanigans to reduce redundant vertexes in our vbo)
+
+.entry gmain
+.proc gmain
+
+    jmpu b0, lod_geoshader
+
+    ; calculate UVs for the four vertexes
+    ; can't use just 0->1, because we use a texture atlas of 8 subtextures in a row
+    ; mat 0 UVs need to be 0->1/8, mat 2 needs 1/8->2/8, etc
+
+    ; so v1 is the material type
+    ; we need two separate coordinates
+    ; technically this will be up to 16 types, 4 bits
+    ; low two bits define x coordinates
+    ; high two bits define y coordinate
+
+    mov r8, one_fourths 
+    mov r9, neg_fours 
+    mov r11, zero_one_zero_one
+    mov r12, one_halfs_on_y
+
+    mov r4.xy, v1.xx; r4 is vvuu
+    mov r4.zw, v1.xx; r4z is vvuu
+    mul r4.zw, r4.zw, r8 ; r6 is vv.uu 
+    flr r4.zw, r4.zw        ; r4.y is vv 
+    mov r5.x, r4.z        ; r5.x is vv 
+    mul r5.x, r5.x, r9       ; r5 *= 4, r5 is -vv00
+    add r4.xy, r4.xy, r5.xx  ; r4.x is now uu
+
+    ; so at this point, i have 
+    ; r4.x -> uu 0->3
+    ; r4.z -> vv 0->3
+
+    add r4, r4, r11
+    mul r4, r4, r8
+
+    add r5, r4, r12
+
+    jmpu skip_x_plus_face, non_lod_skip_x_plus_face
+    ; +x face
+
+    ; for the first three faces
+    ; we share v5
+
+    setemit 0
+    mov outpos, v10
+    mov outtc1, r4.xz ;r0 
+    emit 
+
+    setemit 1
+    mov outpos, v6
+    mov outtc1, r4.yw ;r2
+    ;mov outclr, r12
+    emit
+
+    setemit 2, prim inv
+    mov outpos, v2
+    mov outtc1, r4.yz
+    emit
+
+    setemit 2, prim
+    mov outpos, v14
+    mov outtc1, r4.xw
+    emit
+
+non_lod_skip_x_plus_face:
+
+    jmpu skip_z_plus_face, non_lod_skip_z_plus_face
+    ; +z face 
+
+    jmpu !skip_x_plus_face, non_lod_skip_z_plus_extra_vert
+
+    setemit 0
+    mov outpos, v10
+    mov outtc1, r4.xz ;r0 
+    emit 
+non_lod_skip_z_plus_extra_vert:
+    setemit 1
+    mov outpos, v12
+    mov outtc1, r4.yw
+    emit 
+
+    setemit 2, prim
+    mov outpos, v8
+    mov outtc1, r4.yz 
+    emit 
+
+    setemit 2, prim inv
+    mov outpos, v14
+    mov outtc1, r4.xw 
+    emit 
+
+non_lod_skip_z_plus_face:
+    
+    ; can't skip this, as we have to set the UV correctly
+    ;jmpu !skip_x_plus_face, non_lod_skip_y_minus_extra_vert
+
+    ; -y face 
+
+    setemit 0
+    mov outpos, v10
+    mov outtc1, r5.xz ;r0 
+    emit 
+;non_lod_skip_y_minus_extra_vert:
+    setemit 1
+    mov outpos, v0
+    mov outtc1, r5.yw
+    emit 
+
+    setemit 2, prim
+    mov outpos, v2
+    mov outtc1, r5.yz
+    emit 
+
+    setemit 2, prim inv
+    mov outpos, v8
+    mov outtc1, r5.xw
+    emit 
+
+    ; for the second three faces
+    ; we'll share v2
+    ; which we already use as the first vertex on the -x face anyway
+
+    ; -x face 
+    jmpu skip_x_minus_face, non_lod_skip_x_minus_face
+    setemit 0
+    mov outpos, v4
+    mov outtc1, r4.xw 
+    emit 
+    setemit 1
+    mov outpos, v8
+    mov outtc1, r4.yz 
+    emit 
+    setemit 2, prim
+    mov outpos, v12
+    mov outtc1, r4.yw 
+    emit 
+    setemit 2, prim inv
+    mov outpos, v0
+    mov outtc1, r4.xz 
+    emit 
+
+
+non_lod_skip_x_minus_face:
+    ; -z face 
+
+    jmpu skip_z_minus_face, non_lod_skip_z_minus_face
+
+    jmpu !skip_x_minus_face, non_lod_skip_z_minus_extra_vert 
+
+    setemit 0
+    mov outpos, v4
+    mov outtc1, r4.xw 
+    emit 
+non_lod_skip_z_minus_extra_vert:
+    setemit 1
+    mov outpos, v2 
+    mov outtc1, r4.yz
+    emit 
+    setemit 2, prim
+    mov outpos, v0
+    mov outtc1, r4.xz
+    emit 
+    setemit 2, prim inv 
+    mov outpos, v6
+    mov outtc1, r4.yw
+    emit
+
+
+non_lod_skip_z_minus_face:
+    ; +y face 
+
+    ; we can't skip this anymore, because we need to set the UV for tops separately
+    ;jmpu !skip_x_minus_face, non_lod_skip_y_plus_extra_vert 
+    setemit 0
+    mov outpos, v4
+    mov outtc1, r5.xw 
+    emit 
+non_lod_skip_y_plus_extra_vert:
+    setemit 1
+    mov outpos, v14
+    mov outtc1, r5.yz
+    emit 
+
+    setemit 2, prim
+    mov outpos, v6
+    mov outtc1, r5.xz
+    emit 
+
+    setemit 2, prim inv
+    mov outpos, v12
+    mov outtc1, r5.yw
+    emit 
+
+    end
+
+lod_geoshader:
+
+    ; v1 is color
+
+    mov r0, col_scale
+    mul r0, v1, r0
+    mov r0.w, ones.w
+
+    jmpu skip_x_plus_face, lod_skip_x_plus_face
+    ; +x face
+    ; for the first three faces
+    ; we share v5
+
+    setemit 0
+    mov outpos, v10
+    mov outclr, r0
+    emit 
+
+    setemit 1
+    mov outpos, v6
+    mov outclr, r0
+    emit
+
+    setemit 2, prim inv
+    mov outpos, v2
+    mov outclr, r0
+    emit
+
+    setemit 2, prim
+    mov outpos, v14
+    mov outclr, r0
+    emit
+
+lod_skip_x_plus_face:
+
+    jmpu skip_z_plus_face, lod_skip_z_plus_face
+
+    jmpu !skip_x_plus_face, lod_skip_z_plus_extra_vert
+    ; +z face 
+    setemit 0
+    mov outpos, v10
+    mov outclr, r0
+    emit 
+lod_skip_z_plus_extra_vert:
+    setemit 1
+    mov outpos, v12
+    mov outclr, r0
+    emit 
+
+    setemit 2, prim
+    mov outpos, v8
+    mov outclr, r0
+    emit 
+
+    setemit 2, prim inv
+    mov outpos, v14
+    mov outclr, r0
+    emit 
+
+lod_skip_z_plus_face:
+    jmpu !skip_x_plus_face, lod_skip_y_minus_extra_vert
+    ; -y face 
+    setemit 0
+    mov outpos, v10
+    mov outclr, r0
+    emit 
+lod_skip_y_minus_extra_vert:
+    setemit 1
+    mov outpos, v0
+    mov outclr, r0
+    emit 
+
+    setemit 2, prim
+    mov outpos, v2
+    mov outclr, r0
+    emit 
+
+    setemit 2, prim inv
+    mov outpos, v8
+    mov outclr, r0
+    emit 
+
+    ; for the second three faces
+    ; we'll share v2
+    ; which we already use as the first vertex on the -x face anyway
+
+    jmpu skip_x_minus_face, lod_skip_x_minus_face
+    ; -x face 
+
+    setemit 0
+    mov outpos, v4
+    mov outclr, r0
+    emit 
+    setemit 1
+    mov outpos, v8
+    mov outclr, r0
+    emit 
+    setemit 2, prim
+    mov outpos, v12
+    mov outclr, r0
+    emit 
+    setemit 2, prim inv
+    mov outpos, v0
+    mov outclr, r0
+    emit 
+
+lod_skip_x_minus_face:
+    jmpu skip_z_minus_face, lod_skip_z_minus_face
+    ; -z face 
+    jmpu !skip_x_minus_face, lod_skip_z_minus_extra_vert
+    setemit 0
+    mov outpos, v4
+    mov outclr, r0
+    emit 
+lod_skip_z_minus_extra_vert:
+    setemit 1
+    mov outpos, v2 
+    mov outclr, r0
+    emit 
+    setemit 2, prim
+    mov outpos, v0
+    mov outclr, r0
+    emit 
+    setemit 2, prim inv 
+    mov outpos, v6
+    mov outclr, r0
+    emit
+
+lod_skip_z_minus_face:
+    ; +y face 
+
+    jmpu !skip_x_minus_face, lod_skip_y_plus_extra_vert
+
+    setemit 0
+    mov outpos, v4
+    mov outclr, r0
+    emit 
+lod_skip_y_plus_extra_vert:
+    setemit 1
+    mov outpos, v14
+    mov outclr, r0
+    emit 
+
+    setemit 2, prim
+    mov outpos, v6
+    mov outclr, r0
+    emit 
+
+    setemit 2, prim inv
+    mov outpos, v12
+    mov outclr, r0
+    emit 
+
+    end
+
+.end

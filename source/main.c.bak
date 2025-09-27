@@ -469,7 +469,7 @@ void init_chunk_pointers() {
 		lod0_chunk_pointers[i] = mmAlloc(OPTIMIZED_MAX_VERTS*sizeof(gpu_vertex));
 	}
 	//for(int i = 0; i < 0; i++) {
-	//	lod1_chunk_pointers[i] = linearAlloc(MAX_VERTS/8*sizeof(gpu_lod_vertex));
+	//	lod1_chunk_pointers[i] = mmLinearAlloc(MAX_VERTS/8*sizeof(gpu_lod_vertex));
 	//}
 }
 
