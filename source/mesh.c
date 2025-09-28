@@ -44,11 +44,9 @@ typedef struct {
 //static u16 lod2_full_index_list[CHUNK_SIZE*CHUNK_SIZE/4*CHUNK_SIZE*8];
 
 
-#define MAX_LOD2_MESHES 4
-mesh lod2_meshes[MAX_LOD2_MESHES];
-#define MAX_LOD1_MESHES 16
+#define MAX_LOD1_MESHES 32
 mesh lod1_meshes[MAX_LOD1_MESHES];
-#define MAX_LOD0_MESHES 64
+#define MAX_LOD0_MESHES 32
 mesh lod0_meshes[MAX_LOD0_MESHES];
 
 void reset_meshes() {
@@ -68,13 +66,6 @@ void reset_meshes() {
         lod1_meshes[i].vertex_loc = ALLOCATED_IN_RAM;
     }
     
-    for(int i = 0; i < MAX_LOD2_MESHES; i++) {
-        lod2_meshes[i].in_use = 0;
-        lod2_meshes[i].index_buffer = mmLinearAlloc(LOD2_IDX_BUF_SZ*sizeof(u16));
-        lod2_meshes[i].index_loc = ALLOCATED_IN_RAM;
-        lod2_meshes[i].vertex_buffer = mmLinearAlloc(LOD2_VERT_BUF_SZ*sizeof(lod1_vertex));
-        lod2_meshes[i].vertex_loc = ALLOCATED_IN_RAM;
-    }
 }
 
 // meshes needs to do the following

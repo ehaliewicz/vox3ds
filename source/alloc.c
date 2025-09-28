@@ -56,7 +56,10 @@ void* mmAlloc(size_t size) {
 	if (!addr) {
 		printf("! OUT OF VRAM %lu < %i\n", vramSpaceFree() / 1024, size / 1024);
 		addr = mmLinearAlloc(size);
-		ASSERT(addr != NULL);
+		if(addr != NULL) { 
+			
+		}
+		//ASSERT(addr != NULL);
 	} else {
 		mmLogVRAM();
 	}

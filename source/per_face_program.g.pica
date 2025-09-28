@@ -57,6 +57,7 @@
     mov r11, zero_one_zero_one
     mov r12, one_halfs_on_y
 
+    ; use vertex 0's texture id
     mov r4.xy, v9.xx; r4 is vvuu
     mov r4.zw, v9.xx; r4z is vvuu
     mul r4.zw, r4.zw, r8 ; r6 is vv.uu 

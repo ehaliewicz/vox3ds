@@ -1,2 +1,2 @@
--f rgb565 -m cubic -z none
+-f rgba5651 -m triangle -z none
 atlas_cube.png
